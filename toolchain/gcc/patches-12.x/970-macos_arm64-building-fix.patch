@@ -43,3 +43,70 @@ Date:   Mon Aug 16 13:16:21 2021 +0100
  }
 +
 +const struct host_hooks host_hooks = HOST_HOOKS_INITIALIZER;
+--- a/gcc/system.h
++++ b/gcc/system.h
+@@ -197,2 +197,2 @@
+-/* Include <string> before "safe-ctype.h" to avoid GCC poisoning
+-   the ctype macros through safe-ctype.h */
++/* Include requested C++ headers before "safe-ctype.h" to avoid GCC poisoning
++   the ctype macros through safe-ctype.h.  */
+@@ -200,0 +201,21 @@
++#if defined (INCLUDE_ALGORITHM) || !defined (HAVE_SWAP_IN_UTILITY)
++# include <algorithm>
++#endif
++#ifdef INCLUDE_LIST
++# include <list>
++#endif
++#ifdef INCLUDE_MAP
++# include <map>
++#endif
++#ifdef INCLUDE_SET
++# include <set>
++#endif
++#ifdef INCLUDE_VECTOR
++# include <vector>
++#endif
++#ifdef INCLUDE_ARRAY
++# include <array>
++#endif
++#ifdef INCLUDE_FUNCTIONAL
++# include <functional>
++#endif
+@@ -220,21 +241,0 @@
+-#if defined (INCLUDE_ALGORITHM) || !defined (HAVE_SWAP_IN_UTILITY)
+-# include <algorithm>
+-#endif
+-#ifdef INCLUDE_LIST
+-# include <list>
+-#endif
+-#ifdef INCLUDE_MAP
+-# include <map>
+-#endif
+-#ifdef INCLUDE_SET
+-# include <set>
+-#endif
+-#ifdef INCLUDE_VECTOR
+-# include <vector>
+-#endif
+-#ifdef INCLUDE_ARRAY
+-# include <array>
+-#endif
+-#ifdef INCLUDE_FUNCTIONAL
+-# include <functional>
+-#endif
+--- a/libcc1/libcc1plugin.cc
++++ b/libcc1/libcc1plugin.cc
+@@ -33,0 +34,2 @@
++#include <vector>
++
+@@ -71,2 +72,0 @@
+-
+-#include <vector>
+--- a/libcc1/libcp1plugin.cc
++++ b/libcc1/libcp1plugin.cc
+@@ -34,0 +35,2 @@
++#include <vector>
++
+@@ -73,2 +74,0 @@
+-
+-#include <vector>
