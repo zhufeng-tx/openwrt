@@ -1,0 +1,15 @@
+{
+    "luci-app-wifi-test-tools": {
+        "description": "Grant access to bandwidth test tools",
+        "read": {
+            "ubus": {
+                "luci.bw_test": [ "tcp_status", "tcp_read", "udp_status", "udp_read", "wltp_status", "wltp_read" ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "luci.bw_test": [ "tcp_start", "tcp_stop", "udp_start", "udp_stop", "wltp_start", "wltp_stop" ]
+            }
+        }
+    }
+}

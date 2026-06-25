@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "mt7628an_devboard_wifi-test-board.dtsi"
+
+/ {
+	compatible = "devboard,wifi-test-board-8m", "mediatek,mt7628an-soc";
+	model = "DevBoard WiFi Test Board (8M)";
+};
+
+&firmware {
+	reg = <0x50000 0x7b0000>;
+};
+
+&sdhci {
+	status = "okay";
+	mediatek,cd-low;
+	mediatek,cd-poll;
+};

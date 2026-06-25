@@ -1,0 +1,15 @@
+{
+    "luci-app-wifi-test-fmac-config": {
+        "description": "Grant access to WiFi Test FMAC configuration",
+        "read": {
+            "ubus": {
+                "luci.fmac_config": [ "get_config", "get_status" ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "luci.fmac_config": [ "apply_config" ]
+            }
+        }
+    }
+}

@@ -1,0 +1,10 @@
+{
+    "admin/wifi-test": {
+        "title": "WiFi Test",
+        "order": 55,
+        "action": {
+            "type": "firstchild",
+            "recurse": true
+        }
+    }
+}

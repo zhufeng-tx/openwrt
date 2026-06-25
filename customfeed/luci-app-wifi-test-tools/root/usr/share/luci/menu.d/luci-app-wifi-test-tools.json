@@ -1,0 +1,48 @@
+{
+    "admin/wifi-test/test-tools": {
+        "title": "Test Tools",
+        "order": 20,
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-tools" ]
+        }
+    },
+    "admin/wifi-test/test-tools/udp": {
+        "title": "UDP Bandwidth Test",
+        "order": 10,
+        "action": {
+            "type": "view",
+            "path": "test-tools/udp"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-tools" ]
+        }
+    },
+    "admin/wifi-test/test-tools/tcp": {
+        "title": "TCP Bandwidth Test",
+        "order": 20,
+        "action": {
+            "type": "view",
+            "path": "test-tools/tcp"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-tools" ]
+        }
+    },
+    "admin/wifi-test/test-tools/wltp": {
+        "title": "Stage Lighting Protocol Test",
+        "order": 30,
+        "action": {
+            "type": "view",
+            "path": "test-tools/wltp"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-tools" ],
+            "fs": {
+                "/usr/bin/wltp": "executable"
+            }
+        }
+    }
+}

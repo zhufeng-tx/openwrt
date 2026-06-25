@@ -1,0 +1,442 @@
+#!/bin/sh
+. /usr/share/libubox/jshn.sh
+
+BW_TEST=/usr/bin/bw-test-bwc
+TCP_CMD=/usr/bin/tcp_test
+UDP_CMD=/usr/bin/udp_test
+WLTP_CMD=/usr/bin/wltp
+WLTP_STATE_DIR=/var/lib/bw-test
+WLTP_PID="$WLTP_STATE_DIR/wltp.pid"
+WLTP_LOG="$WLTP_STATE_DIR/wltp.log"
+WLTP_ARGS="$WLTP_STATE_DIR/wltp.args"
+
+json_error() {
+	json_init
+	json_add_int "code" 1
+	json_add_string "error" "$1"
+	json_dump
+}
+
+json_success() {
+	json_init
+	json_add_int "code" 0
+	json_dump
+}
+
+is_uint() {
+	case "$1" in
+	""|*[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+validate_token() {
+	name="$1"
+	value="$2"
+
+	case "$value" in
+	""|*[!A-Za-z0-9_.:-]*)
+		json_error "invalid $name"
+		return 1
+		;;
+	esac
+
+	return 0
+}
+
+validate_mode() {
+	case "$1" in
+	sender|receiver|reflector)
+		return 0
+		;;
+	esac
+
+	json_error "invalid mode"
+	return 1
+}
+
+validate_ipv4() {
+	name="$1"
+	ip="$2"
+
+	case "$ip" in
+	""|*/*|*..*|*[!0-9.]*|.*|*.)
+		json_error "invalid $name"
+		return 1
+		;;
+	esac
+
+	oldifs="$IFS"
+	IFS=.
+	set -- $ip
+	IFS="$oldifs"
+
+	[ "$#" -eq 4 ] || {
+		json_error "invalid $name"
+		return 1
+	}
+
+	for octet in "$@"; do
+		is_uint "$octet" && [ "$octet" -le 255 ] 2>/dev/null || {
+			json_error "invalid $name"
+			return 1
+		}
+	done
+
+	return 0
+}
+
+validate_uint_range() {
+	name="$1"
+	value="$2"
+	min="$3"
+	max="$4"
+
+	is_uint "$value" && [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] 2>/dev/null || {
+		json_error "invalid $name"
+		return 1
+	}
+
+	return 0
+}
+
+validate_protocols() {
+	protocols="$1"
+
+	case "$protocols" in
+	""|*/*|*[!A-Za-z0-9_,.-]*)
+		json_error "invalid protocols"
+		return 1
+		;;
+	esac
+
+	oldifs="$IFS"
+	IFS=,
+	set -- $protocols
+	IFS="$oldifs"
+
+	[ "$#" -gt 0 ] || {
+		json_error "invalid protocols"
+		return 1
+	}
+
+	for proto in "$@"; do
+		case "$proto" in
+		all|artnet|sacn|osc|manet2|rtpmidi|psn|klingnet|citp|kinet)
+			;;
+		*)
+			json_error "invalid protocol: $proto"
+			return 1
+			;;
+		esac
+	done
+
+	return 0
+}
+
+wltp_pid_running() {
+	pid="$1"
+
+	is_uint "$pid" && [ "$pid" -gt 0 ] 2>/dev/null || return 1
+	kill -0 "$pid" 2>/dev/null || return 1
+
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	cmdline=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+	case "$cmdline" in
+	"$WLTP_CMD"*|*"/wltp "*) return 0 ;;
+	esac
+
+	return 1
+}
+
+wltp_current_pid() {
+	[ -f "$WLTP_PID" ] || return 1
+	pid=$(cat "$WLTP_PID" 2>/dev/null)
+	wltp_pid_running "$pid" || return 1
+	printf '%s' "$pid"
+}
+
+wltp_stop_process() {
+	pid=$(wltp_current_pid) || return 1
+
+	kill "$pid" 2>/dev/null || return 1
+	count=0
+	while wltp_pid_running "$pid" && [ "$count" -lt 5 ]; do
+		sleep 1
+		count=$((count + 1))
+	done
+
+	wltp_pid_running "$pid" && kill -KILL "$pid" 2>/dev/null
+	return 0
+}
+
+case "$1" in
+list)
+	echo '{
+		"tcp_start":  {"port":0,"ipaddr":"","nodelay":false,"bufsize":0,"interval":0},
+		"tcp_stop":   {},
+		"tcp_status": {},
+		"tcp_read":   {},
+		"udp_start":  {"local_ip":"","dest_ip":"","tx_mode":false,"port":0,"pkt_len":0,"bandwidth":0},
+		"udp_stop":   {},
+		"udp_status": {},
+		"udp_read":   {},
+		"wltp_start": {"mode":"","iface":"","dest_ip":"","protocols":"","rate":0,"duration":0,"interval":0,"universe":0,"pkt_size":0,"burst":0},
+		"wltp_stop":  {},
+		"wltp_status":{},
+		"wltp_read":  {}
+	}'
+	;;
+call)
+	case "$2" in
+	tcp_start)
+		json_load "$(cat)"
+		json_get_var port     port
+		json_get_var ipaddr   ipaddr
+		json_get_var nodelay  nodelay
+		json_get_var bufsize  bufsize
+		json_get_var interval interval
+
+		port="${port:-60001}"
+		interval="${interval:-1000}"
+
+		# clamp port to valid range
+		[ "$port" -ge 1 ] && [ "$port" -le 65535 ] 2>/dev/null || port=60001
+		# clamp interval: minimum 100ms
+		[ "$interval" -ge 100 ] 2>/dev/null || interval=100
+
+		# validate ipaddr: must be dotted-quad, no path traversal
+		if [ -n "$ipaddr" ]; then
+			case "$ipaddr" in
+			*[!/0-9.]*|""|*..*)
+				json_init; json_add_int "code" 1; json_add_string "error" "invalid ipaddr"; json_dump
+				exit 0
+				;;
+			esac
+		fi
+
+		# build tcp_test command args
+		set -- "$TCP_CMD" "$port"
+		[ -n "$ipaddr" ] && set -- "$@" "$ipaddr"
+		[ "$nodelay" = "true" ] && set -- "$@" "N"
+		if [ "${bufsize:-0}" -gt 0 ] 2>/dev/null; then
+			set -- "$@" "S" "$bufsize"
+		fi
+		set -- "$@" "i" "$interval"
+
+		$BW_TEST -s tcp -- "$@" >/dev/null 2>&1
+		json_init; json_add_int "code" 0; json_dump
+		;;
+
+	tcp_stop)
+		$BW_TEST -k tcp >/dev/null 2>&1
+		json_init; json_add_int "code" 0; json_dump
+		;;
+
+	tcp_status)
+		result=$($BW_TEST -q tcp 2>/dev/null)
+		[ -n "$result" ] && printf '%s' "$result" || echo '{"running":false}'
+		;;
+
+	tcp_read)
+		data=$($BW_TEST -r tcp 2>/dev/null)
+		printf '{"result":[%s]}' "$data"
+		;;
+
+	udp_start)
+		json_load "$(cat)"
+		json_get_var local_ip  local_ip
+		json_get_var dest_ip   dest_ip
+		json_get_var tx_mode   tx_mode
+		json_get_var port      port
+		json_get_var pkt_len   pkt_len
+		json_get_var bandwidth bandwidth
+
+		port="${port:-56999}"
+		pkt_len="${pkt_len:-512}"
+		bandwidth="${bandwidth:-128}"
+
+		# clamp port
+		[ "$port" -ge 1 ] && [ "$port" -le 65535 ] 2>/dev/null || port=56999
+
+		# validate IPs: must contain dots, no slashes or double-dots
+		for ip in "$local_ip" "$dest_ip"; do
+			case "$ip" in
+			*/*|*..*|*[!0-9.]*|"")
+				json_init; json_add_int "code" 1; json_add_string "error" "invalid ip: $ip"; json_dump
+				exit 0
+				;;
+			esac
+		done
+
+		# build udp_test command args
+		set -- "$UDP_CMD" "$local_ip" "$dest_ip"
+		if [ "$tx_mode" = "true" ]; then
+			set -- "$@" "-t" "-l" "$pkt_len" "-b" "$bandwidth"
+		fi
+		set -- "$@" "-p" "$port"
+
+		$BW_TEST -s udp -- "$@" >/dev/null 2>&1
+		json_init; json_add_int "code" 0; json_dump
+		;;
+
+	udp_stop)
+		$BW_TEST -k udp >/dev/null 2>&1
+		json_init; json_add_int "code" 0; json_dump
+		;;
+
+	udp_status)
+		result=$($BW_TEST -q udp 2>/dev/null)
+		[ -n "$result" ] && printf '%s' "$result" || echo '{"running":false}'
+		;;
+
+	udp_read)
+		data=$($BW_TEST -r udp 2>/dev/null)
+		printf '{"result":[%s]}' "$data"
+		;;
+
+	wltp_start)
+		json_load "$(cat)"
+		json_get_var mode      mode
+		json_get_var iface     iface
+		json_get_var dest_ip   dest_ip
+		json_get_var protocols protocols
+		json_get_var rate      rate
+		json_get_var duration  duration
+		json_get_var interval  interval
+		json_get_var universe  universe
+		json_get_var pkt_size  pkt_size
+		json_get_var burst     burst
+
+		mode="${mode:-receiver}"
+		protocols="${protocols:-all}"
+		rate="${rate:-30}"
+		duration="${duration:-0}"
+		interval="${interval:-1}"
+		universe="${universe:-1}"
+		pkt_size="${pkt_size:-0}"
+		burst="${burst:-1}"
+
+		[ -x "$WLTP_CMD" ] || {
+			json_error "wltp executable not found"
+			exit 0
+		}
+
+		mkdir -p "$WLTP_STATE_DIR" 2>/dev/null || {
+			json_error "failed to create runtime directory"
+			exit 0
+		}
+
+		if wltp_current_pid >/dev/null; then
+			json_error "wltp already running"
+			exit 0
+		fi
+
+		validate_token "mode" "$mode" || exit 0
+		validate_mode "$mode" || exit 0
+		validate_token "iface" "$iface" || exit 0
+		if [ "$mode" = "sender" ]; then
+			validate_ipv4 "dest_ip" "$dest_ip" || exit 0
+		else
+			dest_ip=""
+		fi
+		validate_protocols "$protocols" || exit 0
+		validate_uint_range "rate" "$rate" 1 1000000 || exit 0
+		validate_uint_range "duration" "$duration" 0 86400 || exit 0
+		validate_uint_range "interval" "$interval" 1 86400 || exit 0
+		validate_uint_range "universe" "$universe" 0 63999 || exit 0
+		validate_uint_range "pkt_size" "$pkt_size" 0 1472 || exit 0
+		validate_uint_range "burst" "$burst" 1 100000 || exit 0
+
+		: > "$WLTP_LOG" || {
+			json_error "failed to create log file"
+			exit 0
+		}
+
+		{
+			printf 'mode=%s\n' "$mode"
+			printf 'iface=%s\n' "$iface"
+			printf 'dest_ip=%s\n' "$dest_ip"
+			printf 'protocols=%s\n' "$protocols"
+			printf 'rate=%s\n' "$rate"
+			printf 'duration=%s\n' "$duration"
+			printf 'interval=%s\n' "$interval"
+			printf 'universe=%s\n' "$universe"
+			printf 'pkt_size=%s\n' "$pkt_size"
+			printf 'burst=%s\n' "$burst"
+		} > "$WLTP_ARGS"
+
+		set -- "$WLTP_CMD" "-J" \
+			"-m" "$mode" \
+			"-i" "$iface" \
+			"-p" "$protocols" \
+			"-r" "$rate" \
+			"-d" "$duration" \
+			"-t" "$interval" \
+			"-u" "$universe" \
+			"-b" "$burst"
+		[ "$mode" = "sender" ] && set -- "$@" "-D" "$dest_ip"
+		[ "$pkt_size" -gt 0 ] 2>/dev/null && set -- "$@" "-s" "$pkt_size"
+
+		"$@" > "$WLTP_LOG" 2>&1 < /dev/null &
+		pid=$!
+		printf '%s\n' "$pid" > "$WLTP_PID"
+
+		json_init
+		json_add_int "code" 0
+		json_add_int "pid" "$pid"
+		json_dump
+		;;
+
+	wltp_stop)
+		if wltp_stop_process; then
+			rm -f "$WLTP_PID"
+			json_success
+		else
+			rm -f "$WLTP_PID"
+			json_init
+			json_add_int "code" 0
+			json_add_boolean "stopped" 0
+			json_dump
+		fi
+		;;
+
+	wltp_status)
+		pid=$(wltp_current_pid)
+		running=0
+		[ -n "$pid" ] && running=1
+		[ "$running" -eq 0 ] && rm -f "$WLTP_PID"
+
+		json_init
+		json_add_boolean "running" "$running"
+		[ "$running" -eq 1 ] && json_add_int "pid" "$pid"
+		if [ -f "$WLTP_ARGS" ]; then
+			while IFS='=' read -r key value; do
+				case "$key" in
+				mode|iface|protocols|rate|duration|interval|universe|pkt_size|burst)
+					json_add_string "$key" "$value"
+					;;
+				dest_ip)
+					json_add_string "dest_ip" "$value"
+					json_add_string "destination" "$value"
+					;;
+				esac
+			done < "$WLTP_ARGS"
+		fi
+		json_dump
+		;;
+
+	wltp_read)
+		json_init
+		json_add_array "result"
+		if [ -f "$WLTP_LOG" ]; then
+			while IFS= read -r line; do
+				json_add_string "" "$line"
+			done < "$WLTP_LOG"
+		fi
+		json_close_array
+		json_dump
+		;;
+	esac
+	;;
+esac

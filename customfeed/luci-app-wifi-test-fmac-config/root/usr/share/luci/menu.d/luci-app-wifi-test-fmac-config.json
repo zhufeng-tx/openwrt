@@ -1,0 +1,56 @@
+{
+    "admin/wifi-test/fmac-config": {
+        "title": "FMAC Config",
+        "order": 15,
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-fmac-config" ]
+        }
+    },
+    "admin/wifi-test/fmac-config/basic": {
+        "title": "Basic",
+        "order": 10,
+        "action": {
+            "type": "view",
+            "path": "fmac-config/basic"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-fmac-config" ]
+        }
+    },
+    "admin/wifi-test/fmac-config/channel": {
+        "title": "Channel",
+        "order": 20,
+        "action": {
+            "type": "view",
+            "path": "fmac-config/channel"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-fmac-config" ]
+        }
+    },
+    "admin/wifi-test/fmac-config/advanced": {
+        "title": "Advanced",
+        "order": 30,
+        "action": {
+            "type": "view",
+            "path": "fmac-config/advanced"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-fmac-config" ]
+        }
+    },
+    "admin/wifi-test/fmac-config/multicast": {
+        "title": "Multicast",
+        "order": 40,
+        "action": {
+            "type": "view",
+            "path": "fmac-config/multicast"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-fmac-config" ]
+        }
+    }
+}

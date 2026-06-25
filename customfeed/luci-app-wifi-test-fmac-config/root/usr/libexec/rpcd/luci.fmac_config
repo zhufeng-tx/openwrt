@@ -1,0 +1,630 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+
+HGPRIV=/usr/bin/hgpriv
+
+commands=""
+keyvals=""
+err_msg=""
+mhz_x10=""
+
+set_error() {
+	err_msg="$1"
+	return 1
+}
+
+is_uint() {
+	case "$1" in
+	""|*[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+validate_uint() {
+	name="$1"
+	value="$2"
+
+	is_uint "$value" || set_error "invalid $name"
+}
+
+validate_uint_range() {
+	name="$1"
+	value="$2"
+	min="$3"
+	max="$4"
+
+	is_uint "$value" && [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] 2>/dev/null || \
+		set_error "invalid $name"
+}
+
+validate_ifname() {
+	case "$1" in
+	""|*/*|*..*|*[!A-Za-z0-9_.:-]*) set_error "invalid ifname" ;;
+	*) return 0 ;;
+	esac
+}
+
+validate_token() {
+	name="$1"
+	value="$2"
+
+	case "$value" in
+	""|*[!A-Za-z0-9_.:-]*) set_error "invalid $name" ;;
+	*) return 0 ;;
+	esac
+}
+
+validate_safe_string() {
+	name="$1"
+	value="$2"
+
+	case "$value" in
+	""|*[!A-Za-z0-9_.:@%+=,-]*) set_error "invalid $name" ;;
+	*) return 0 ;;
+	esac
+}
+
+validate_flag() {
+	name="$1"
+	case "$2" in
+	0|1) return 0 ;;
+	*) set_error "invalid $name" ;;
+	esac
+}
+
+validate_bw() {
+	name="$1"
+	case "$2" in
+	1|2|4|8) return 0 ;;
+	*) set_error "invalid $name" ;;
+	esac
+}
+
+validate_mcs() {
+	name="$1"
+	value="$2"
+
+	case "$value" in
+	255) return 0 ;;
+	esac
+	validate_uint_range "$name" "$value" 1 7
+}
+
+validate_wpa_psk() {
+	case "$1" in
+	????????????????????????????????????????????????????????????????)
+		case "$1" in
+		*[!0-9A-Fa-f]*) set_error "invalid wpa_psk" ;;
+		*) return 0 ;;
+		esac
+		;;
+	*) set_error "invalid wpa_psk" ;;
+	esac
+}
+
+validate_mac() {
+	name="$1"
+	mac="$2"
+
+	case "$mac" in
+	[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f])
+		return 0
+		;;
+	*) set_error "invalid $name" ;;
+	esac
+}
+
+validate_mhz() {
+	name="$1"
+	value="$2"
+
+	case "$value" in
+	""|*[!0-9.]*|.*|*.|*.*.*) set_error "invalid $name" ;;
+	*.*)
+		frac="${value#*.}"
+		case "$frac" in
+		[0-9]) return 0 ;;
+		*) set_error "invalid $name" ;;
+		esac
+		;;
+	*) return 0 ;;
+	esac
+}
+
+mhz_to_x10() {
+	name="$1"
+	value="$2"
+
+	validate_mhz "$name" "$value" || return 1
+	case "$value" in
+	*.*)
+		mhz_x10="${value%%.*}${value#*.}"
+		;;
+	*)
+		mhz_x10="${value}0"
+		;;
+	esac
+	return 0
+}
+
+append_value() {
+	list_name="$1"
+	value="$2"
+
+	if [ "$list_name" = "commands" ]; then
+		if [ -n "$commands" ]; then
+			commands="${commands}
+$value"
+		else
+			commands="$value"
+		fi
+	else
+		if [ -n "$keyvals" ]; then
+			keyvals="${keyvals}
+$value"
+		else
+			keyvals="$value"
+		fi
+	fi
+}
+
+add_keyval() {
+	keyval="$1"
+	append_value keyvals "$keyval"
+	append_value commands "$HGPRIV $ifname set $keyval"
+}
+
+add_simple_token() {
+	key="$1"
+	value="$2"
+
+	[ -z "$value" ] && return 0
+	validate_token "$key" "$value" || return 1
+	add_keyval "$key=$value"
+}
+
+add_safe_string() {
+	key="$1"
+	value="$2"
+
+	[ -z "$value" ] && return 0
+	validate_safe_string "$key" "$value" || return 1
+	add_keyval "$key=$value"
+}
+
+convert_mhz_list() {
+	name="$1"
+	value="$2"
+	out=""
+
+	case "$value" in
+	""|,*|*,|*,,*|*[!0-9.,]*) set_error "invalid $name" ;;
+	*)
+		oldifs="$IFS"
+		IFS=,
+		set -- $value
+		IFS="$oldifs"
+		[ "$#" -gt 0 ] || set_error "invalid $name" || return 1
+		for item in "$@"; do
+			mhz_to_x10 "$name" "$item" || return 1
+			if [ -n "$out" ]; then
+				out="$out,$mhz_x10"
+			else
+				out="$mhz_x10"
+			fi
+		done
+		converted_list="$out"
+		return 0
+		;;
+	esac
+
+	return 1
+}
+
+build_acs() {
+	value="$1"
+	enable="$2"
+	timeout="$3"
+
+	if [ -n "$value" ]; then
+		case "$value" in
+		*,*) : ;;
+		*) set_error "invalid acs"; return 1 ;;
+		esac
+		oldifs="$IFS"
+		IFS=,
+		set -- $value
+		IFS="$oldifs"
+		[ "$#" -eq 2 ] || { set_error "invalid acs"; return 1; }
+		enable="$1"
+		timeout="$2"
+	elif [ -n "$enable" ] || [ -n "$timeout" ]; then
+		[ -n "$enable" ] && [ -n "$timeout" ] || { set_error "invalid acs"; return 1; }
+	else
+		return 0
+	fi
+
+	validate_flag acs "$enable" || return 1
+	validate_uint acs_timeout "$timeout" || return 1
+	add_keyval "acs=$enable,$timeout"
+}
+
+build_freq_range() {
+	value="$1"
+	start="$2"
+	end="$3"
+	bw="$4"
+
+	if [ -n "$value" ]; then
+		case "$value" in
+		*,*,*) : ;;
+		*) set_error "invalid freq_range"; return 1 ;;
+		esac
+		oldifs="$IFS"
+		IFS=,
+		set -- $value
+		IFS="$oldifs"
+		[ "$#" -eq 3 ] || { set_error "invalid freq_range"; return 1; }
+		start="$1"
+		end="$2"
+		bw="$3"
+	elif [ -n "$start" ] || [ -n "$end" ] || [ -n "$bw" ]; then
+		[ -n "$start" ] && [ -n "$end" ] && [ -n "$bw" ] || { set_error "invalid freq_range"; return 1; }
+	else
+		return 0
+	fi
+
+	mhz_to_x10 freq_range_start "$start" || return 1
+	start_x10="$mhz_x10"
+	mhz_to_x10 freq_range_end "$end" || return 1
+	end_x10="$mhz_x10"
+	validate_mhz freq_range_bw "$bw" || return 1
+	[ "$start_x10" -le "$end_x10" ] 2>/dev/null || { set_error "invalid freq_range"; return 1; }
+	add_keyval "freq_range=$start_x10,$end_x10,$bw"
+}
+
+build_pair_uint() {
+	key="$1"
+	name1="$2"
+	value1="$3"
+	name2="$4"
+	value2="$5"
+	combined="$6"
+
+	if [ -n "$combined" ]; then
+		case "$combined" in
+		*,*) : ;;
+		*) set_error "invalid $key"; return 1 ;;
+		esac
+		oldifs="$IFS"
+		IFS=,
+		set -- $combined
+		IFS="$oldifs"
+		[ "$#" -eq 2 ] || { set_error "invalid $key"; return 1; }
+		value1="$1"
+		value2="$2"
+	elif [ -n "$value1" ] || [ -n "$value2" ]; then
+		[ -n "$value1" ] && [ -n "$value2" ] || { set_error "invalid $key"; return 1; }
+	else
+		return 0
+	fi
+
+	validate_uint "$name1" "$value1" || return 1
+	validate_uint "$name2" "$value2" || return 1
+	add_keyval "$key=$value1,$value2"
+}
+
+build_join_group() {
+	combined="$1"
+	mac="$2"
+	aid="$3"
+
+	if [ -n "$combined" ]; then
+		case "$combined" in
+		*,*) : ;;
+		*) set_error "invalid join_group"; return 1 ;;
+		esac
+		oldifs="$IFS"
+		IFS=,
+		set -- $combined
+		IFS="$oldifs"
+		[ "$#" -eq 2 ] || { set_error "invalid join_group"; return 1; }
+		mac="$1"
+		aid="$2"
+	elif [ -n "$mac" ] || [ -n "$aid" ]; then
+		[ -n "$mac" ] && [ -n "$aid" ] || { set_error "invalid join_group"; return 1; }
+	else
+		return 0
+	fi
+
+	validate_mac join_group_mac "$mac" || return 1
+	validate_uint join_group_aid "$aid" || return 1
+	add_keyval "join_group=$mac,$aid"
+}
+
+build_mcast_txparam() {
+	combined="$1"
+	dupcnt="$2"
+	bw="$3"
+	mcs="$4"
+	clearch="$5"
+
+	if [ -n "$combined" ]; then
+		case "$combined" in
+		*,*,*,*) : ;;
+		*) set_error "invalid mcast_txparam"; return 1 ;;
+		esac
+		oldifs="$IFS"
+		IFS=,
+		set -- $combined
+		IFS="$oldifs"
+		[ "$#" -eq 4 ] || { set_error "invalid mcast_txparam"; return 1; }
+		dupcnt="$1"
+		bw="$2"
+		mcs="$3"
+		clearch="$4"
+	elif [ -n "$dupcnt" ] || [ -n "$bw" ] || [ -n "$mcs" ] || [ -n "$clearch" ]; then
+		[ -n "$dupcnt" ] && [ -n "$bw" ] && [ -n "$mcs" ] && [ -n "$clearch" ] || { set_error "invalid mcast_txparam"; return 1; }
+	else
+		return 0
+	fi
+
+	validate_uint mcast_dupcnt "$dupcnt" || return 1
+	validate_bw mcast_tx_bw "$bw" || return 1
+	validate_mcs mcast_tx_mcs "$mcs" || return 1
+	validate_flag mcast_clearch "$clearch" || return 1
+	add_keyval "mcast_txparam=$dupcnt,$bw,$mcs,$clearch"
+}
+
+dump_commands_array() {
+	json_add_array "commands"
+	oldifs="$IFS"
+	IFS='
+'
+	for cmd in $commands; do
+		[ -n "$cmd" ] && json_add_string "" "$cmd"
+	done
+	IFS="$oldifs"
+	json_close_array
+}
+
+dump_response() {
+	code="$1"
+	error="$2"
+
+	json_init
+	json_add_int "code" "$code"
+	json_add_string "error" "$error"
+	dump_commands_array
+	json_dump
+}
+
+run_config_commands() {
+	oldifs="$IFS"
+	IFS='
+'
+	for keyval in $keyvals; do
+		[ -n "$keyval" ] || continue
+		out=$($HGPRIV "$ifname" set "$keyval" 2>&1)
+		rc=$?
+		if [ "$rc" -ne 0 ]; then
+			IFS="$oldifs"
+			err_msg="${out:-hgpriv failed (exit code $rc)}"
+			return 1
+		fi
+	done
+	IFS="$oldifs"
+	return 0
+}
+
+apply_config() {
+	commands=""
+	keyvals=""
+	err_msg=""
+	have_chan_list=0
+	tx_bw_value=""
+	bss_bw_value=""
+
+	json_select config || { dump_response 1 "missing config"; return; }
+	json_get_var ifname ifname
+	json_get_var dry_run dry_run
+	json_get_var mode mode
+	json_get_var ssid ssid
+	json_get_var ap_hide ap_hide
+	json_get_var key_mgmt key_mgmt
+	json_get_var wpa_psk wpa_psk
+	json_get_var tx_bw tx_bw
+	json_get_var tx_mcs tx_mcs
+	json_get_var acs acs
+	json_get_var acs_enable acs_enable
+	json_get_var acs_timeout acs_timeout
+	json_get_var chan_list chan_list
+	json_get_var chan_list_mhz chan_list_mhz
+	json_get_var freq_range freq_range
+	json_get_var freq_start_mhz freq_start_mhz
+	json_get_var freq_end_mhz freq_end_mhz
+	json_get_var freq_bw_mhz freq_bw_mhz
+	json_get_var freq_range_start_mhz freq_range_start_mhz
+	json_get_var freq_range_end_mhz freq_range_end_mhz
+	json_get_var freq_range_bw_mhz freq_range_bw_mhz
+	json_get_var bss_bw bss_bw
+	json_get_var txpower txpower
+	json_get_var super_pwr super_pwr
+	json_get_var agg_cnt agg_cnt
+	json_get_var agg_tx agg_tx
+	json_get_var agg_rx agg_rx
+	json_get_var max_txcnt max_txcnt
+	json_get_var mcast_key mcast_key
+	json_get_var join_group join_group
+	json_get_var join_group_mac join_group_mac
+	json_get_var join_group_aid join_group_aid
+	json_get_var mcast_txparam mcast_txparam
+	json_get_var mcast_dupcnt mcast_dupcnt
+	json_get_var mcast_tx_bw mcast_tx_bw
+	json_get_var mcast_tx_mcs mcast_tx_mcs
+	json_get_var mcast_clearch mcast_clearch
+	json_select ..
+
+	validate_ifname "$ifname" || { dump_response 1 "$err_msg"; return; }
+
+	if [ -n "$mode" ]; then
+		case "$mode" in
+		ap|sta)
+			add_keyval "mode=$mode"
+			;;
+		*)
+			err_msg="invalid mode"
+			dump_response 1 "$err_msg"
+			return
+			;;
+		esac
+	fi
+	add_safe_string ssid "$ssid" || { dump_response 1 "$err_msg"; return; }
+	if [ -n "$ap_hide" ]; then
+		validate_flag ap_hide "$ap_hide" || { dump_response 1 "$err_msg"; return; }
+		add_keyval "ap_hide=$ap_hide"
+	fi
+	add_simple_token key_mgmt "$key_mgmt" || { dump_response 1 "$err_msg"; return; }
+	if [ -n "$wpa_psk" ]; then
+		validate_wpa_psk "$wpa_psk" || { dump_response 1 "$err_msg"; return; }
+		add_keyval "wpa_psk=$wpa_psk"
+	fi
+	if [ -n "$tx_bw" ]; then
+		validate_bw tx_bw "$tx_bw" || { dump_response 1 "$err_msg"; return; }
+		tx_bw_value="$tx_bw"
+		add_keyval "tx_bw=$tx_bw"
+	fi
+	if [ -n "$tx_mcs" ]; then
+		validate_mcs tx_mcs "$tx_mcs" || { dump_response 1 "$err_msg"; return; }
+		add_keyval "tx_mcs=$tx_mcs"
+	fi
+	build_acs "$acs" "$acs_enable" "$acs_timeout" || { dump_response 1 "$err_msg"; return; }
+
+	[ -z "$chan_list_mhz" ] && chan_list_mhz="$chan_list"
+	if [ -n "$chan_list_mhz" ]; then
+		convert_mhz_list chan_list "$chan_list_mhz" || { dump_response 1 "$err_msg"; return; }
+		add_keyval "chan_list=$converted_list"
+		have_chan_list=1
+	fi
+
+	[ -z "$freq_start_mhz" ] && freq_start_mhz="$freq_range_start_mhz"
+	[ -z "$freq_end_mhz" ] && freq_end_mhz="$freq_range_end_mhz"
+	[ -z "$freq_bw_mhz" ] && freq_bw_mhz="$freq_range_bw_mhz"
+	if [ "$have_chan_list" -eq 0 ]; then
+		build_freq_range "$freq_range" "$freq_start_mhz" "$freq_end_mhz" "$freq_bw_mhz" || { dump_response 1 "$err_msg"; return; }
+	fi
+
+	if [ -n "$bss_bw" ]; then
+		validate_bw bss_bw "$bss_bw" || { dump_response 1 "$err_msg"; return; }
+		bss_bw_value="$bss_bw"
+		add_keyval "bss_bw=$bss_bw"
+	fi
+	if [ -n "$tx_bw_value" ] && [ -n "$bss_bw_value" ]; then
+		[ "$bss_bw_value" -gt "$tx_bw_value" ] 2>/dev/null || { err_msg="invalid bss_bw"; dump_response 1 "$err_msg"; return; }
+	fi
+	if [ -n "$txpower" ]; then
+		validate_uint_range txpower "$txpower" 0 20 || { dump_response 1 "$err_msg"; return; }
+		add_keyval "txpower=$txpower"
+	fi
+	if [ -n "$super_pwr" ]; then
+		validate_flag super_pwr "$super_pwr" || { dump_response 1 "$err_msg"; return; }
+		add_keyval "super_pwr=$super_pwr"
+	fi
+	build_pair_uint agg_cnt agg_tx "$agg_tx" agg_rx "$agg_rx" "$agg_cnt" || { dump_response 1 "$err_msg"; return; }
+	if [ -n "$max_txcnt" ]; then
+		validate_uint max_txcnt "$max_txcnt" || { dump_response 1 "$err_msg"; return; }
+		add_keyval "max_txcnt=$max_txcnt"
+	fi
+	add_safe_string mcast_key "$mcast_key" || { dump_response 1 "$err_msg"; return; }
+	build_join_group "$join_group" "$join_group_mac" "$join_group_aid" || { dump_response 1 "$err_msg"; return; }
+	build_mcast_txparam "$mcast_txparam" "$mcast_dupcnt" "$mcast_tx_bw" "$mcast_tx_mcs" "$mcast_clearch" || { dump_response 1 "$err_msg"; return; }
+
+	case "$dry_run" in
+	true|1)
+		dump_response 0 ""
+		return
+		;;
+	esac
+
+	[ -z "$keyvals" ] && { dump_response 0 ""; return; }
+	[ -x "$HGPRIV" ] || { dump_response 1 "hgpriv executable not found"; return; }
+	run_config_commands || { dump_response 1 "$err_msg"; return; }
+	dump_response 0 ""
+}
+
+get_config() {
+	err_msg=""
+	json_get_var ifname ifname
+	[ -n "$ifname" ] && validate_ifname "$ifname" || ifname=""
+	if [ -n "$err_msg" ]; then
+		json_init
+		json_add_int "code" 1
+		json_add_string "error" "$err_msg"
+		json_add_object "config"
+		json_close_object
+		json_dump
+		return
+	fi
+
+	json_init
+	json_add_int "code" 0
+	json_add_string "error" ""
+	json_add_object "config"
+	[ -n "$ifname" ] && json_add_string "ifname" "$ifname"
+	json_close_object
+	json_dump
+}
+
+get_status() {
+	err_msg=""
+	status=""
+	json_get_var ifname ifname
+	[ -n "$ifname" ] && validate_ifname "$ifname" || ifname=""
+	if [ -n "$err_msg" ]; then
+		json_init
+		json_add_int "code" 1
+		json_add_string "error" "$err_msg"
+		json_add_string "status" ""
+		json_dump
+		return
+	fi
+
+	if [ -n "$ifname" ] && [ -f "/proc/$ifname/status" ]; then
+		status=$(cat "/proc/$ifname/status" 2>/dev/null)
+	elif [ -f /proc/hgicf/status ]; then
+		status=$(cat /proc/hgicf/status 2>/dev/null)
+	fi
+
+	json_init
+	json_add_int "code" 0
+	json_add_string "error" ""
+	json_add_string "status" "$status"
+	json_dump
+}
+
+case "$1" in
+list)
+	echo '{"get_config":{"ifname":""},"apply_config":{"config":{}},"get_status":{"ifname":""}}'
+	;;
+call)
+	json_load "$(cat)"
+	case "$2" in
+	get_config)
+		get_config
+		;;
+	apply_config)
+		apply_config
+		;;
+	get_status)
+		get_status
+		;;
+	*)
+		echo '{}'
+		;;
+	esac
+	;;
+*)
+	echo '{}'
+	;;
+esac

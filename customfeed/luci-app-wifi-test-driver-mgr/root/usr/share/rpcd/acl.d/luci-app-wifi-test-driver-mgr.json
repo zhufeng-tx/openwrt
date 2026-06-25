@@ -1,0 +1,23 @@
+{
+    "luci-app-wifi-test-driver-mgr": {
+        "description": "Grant access to WiFi Test Driver management",
+        "read": {
+            "ubus": {
+                "luci.test_driver": [ "list_modules", "list_firmwares", "smac_status", "fmac_status" ]
+            }
+        },
+        "write": {
+            "cgi-io": [ "upload" ],
+            "file": {
+                "/tmp/test-ko-upload.ko": [ "write" ],
+                "/tmp/test-fw-upload.bin": [ "write" ]
+            },
+            "ubus": {
+                "luci.test_driver": [
+                    "load_module", "unload_module", "delete_module", "move_uploaded",
+                    "create_symlink", "remove_symlink", "delete_firmware", "move_uploaded_firmware"
+                ]
+            }
+        }
+    }
+}

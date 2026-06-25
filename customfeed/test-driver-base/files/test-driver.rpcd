@@ -1,0 +1,402 @@
+#!/bin/sh
+# rpcd backend for luci-app-test-driver
+# Manages .ko files in /test_ko/ and firmware files in /test_firmware/ via ubus
+
+. /usr/share/libubox/jshn.sh
+
+KO_DIR="/test_ko"
+FW_DIR="/test_firmware"
+FW_LINK_DIR="/lib/firmware"
+
+_validate_filename() {
+	local f="$1"
+	# Must end in .ko, no path separators, no empty
+	case "$f" in
+		*/*|*..*)
+			return 1 ;;
+		*.ko)
+			[ -n "$f" ] && return 0 ;;
+	esac
+	return 1
+}
+
+_validate_fw_filename() {
+	local f="$1"
+	# Non-empty, no path separators, no directory traversal, no hidden files
+	[ -z "$f" ] && return 1
+	case "$f" in
+		*/*|*..*)
+			return 1 ;;
+		.*)
+			return 1 ;;
+	esac
+	return 0
+}
+
+_module_name() {
+	# Strip .ko suffix and convert - to _ (kernel module name convention)
+	echo "${1%.ko}" | tr '-' '_'
+}
+
+case "$1" in
+list)
+	echo '{"list_modules":{},"load_module":{"filename":"String","args":"String"},"unload_module":{"name":"String"},"delete_module":{"filename":"String"},"move_uploaded":{"filename":"String","destname":"String"},"list_firmwares":{},"move_uploaded_firmware":{"filename":"String","destname":"String"},"create_symlink":{"filename":"String","linkname":"String"},"remove_symlink":{"linkname":"String"},"delete_firmware":{"filename":"String"},"smac_status":{},"fmac_status":{}}'
+	;;
+call)
+	case "$2" in
+	list_modules)
+		json_init
+		json_add_array "modules"
+		# Get loaded module names from lsmod (skip header line)
+		loaded=$(lsmod 2>/dev/null | awk 'NR>1{print $1}')
+		for f in "$KO_DIR"/*.ko; do
+			[ -f "$f" ] || continue
+			filename="${f##*/}"
+			size=$(wc -c < "$f" 2>/dev/null || echo 0)
+			modname=$(_module_name "$filename")
+			is_loaded=0
+			for m in $loaded; do
+				[ "$m" = "$modname" ] && is_loaded=1 && break
+			done
+			json_add_object ""
+			json_add_string "filename" "$filename"
+			json_add_int "size" "$size"
+			json_add_boolean "loaded" "$is_loaded"
+			json_close_object
+		done
+		json_close_array
+		json_dump
+		;;
+	load_module)
+		json_load "$(cat)"
+		json_get_var filename filename
+		json_get_var args args
+		if ! _validate_filename "$filename"; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Invalid filename"
+			json_dump
+			exit 0
+		fi
+		target="$KO_DIR/$filename"
+		if [ ! -f "$target" ]; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Module not found"
+			json_dump
+			exit 0
+		fi
+		if [ -n "$args" ]; then
+			# Whitelist: only allow alphanumeric, =, _, space, dot
+			clean_args=$(echo "$args" | tr -cd 'a-zA-Z0-9=_ .')
+			if [ "$clean_args" != "$args" ]; then
+				json_init
+				json_add_int "code" 1
+				json_add_string "error" "Invalid characters in arguments"
+				json_dump
+				exit 0
+			fi
+			insmod "$target" $args 2>/tmp/.insmod_err.$$ >/dev/null
+		else
+			insmod "$target" 2>/tmp/.insmod_err.$$ >/dev/null
+		fi
+		rc=$?
+		err=""
+		if [ -s /tmp/.insmod_err.$$ ]; then
+			err=$(cat /tmp/.insmod_err.$$)
+		fi
+		rm -f /tmp/.insmod_err.$$
+		if [ "$rc" -ne 0 ] && [ -z "$err" ]; then
+			err=$(dmesg 2>/dev/null | tail -n 1)
+		fi
+		json_init
+		json_add_int "code" "$rc"
+		if [ "$rc" -ne 0 ]; then
+			json_add_string "error" "${err:-insmod failed (exit code $rc)}"
+		else
+			json_add_string "error" ""
+		fi
+		json_dump
+		;;
+	unload_module)
+		json_load "$(cat)"
+		json_get_var name name
+		# Validate: no path separators, non-empty
+		case "$name" in
+			*/*|*..*)
+				json_init; json_add_int "code" 1; json_add_string "error" "Invalid name"; json_dump; exit 0 ;;
+		esac
+		[ -z "$name" ] && { json_init; json_add_int "code" 1; json_add_string "error" "Empty name"; json_dump; exit 0; }
+		rmmod "$name" 2>/tmp/.rmmod_err.$$ >/dev/null
+		rc=$?
+		err=""
+		if [ -s /tmp/.rmmod_err.$$ ]; then
+			err=$(cat /tmp/.rmmod_err.$$)
+		fi
+		rm -f /tmp/.rmmod_err.$$
+		json_init
+		json_add_int "code" "$rc"
+		if [ "$rc" -ne 0 ]; then
+			json_add_string "error" "${err:-rmmod failed (exit code $rc)}"
+		else
+			json_add_string "error" ""
+		fi
+		json_dump
+		;;
+	delete_module)
+		json_load "$(cat)"
+		json_get_var filename filename
+		if ! _validate_filename "$filename"; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Invalid filename"
+			json_dump
+			exit 0
+		fi
+		target="$KO_DIR/$filename"
+		if [ ! -f "$target" ]; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Module not found"
+			json_dump
+			exit 0
+		fi
+		modname=$(_module_name "$filename")
+		if lsmod 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$modname"; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Module is currently loaded — unload it first"
+			json_dump
+			exit 0
+		fi
+		err=$(rm -f "$target" 2>&1)
+		rc=$?
+		json_init
+		json_add_int "code" "$rc"
+		[ "$rc" -ne 0 ] && json_add_string "error" "${err:-Failed to delete module}"
+		json_dump
+		;;
+	move_uploaded)
+		json_load "$(cat)"
+		json_get_var filename filename
+		json_get_var destname destname
+		# filename is the full source path (e.g. /tmp/test-ko-upload.ko)
+		# destname is the target basename in /test_ko
+		if ! _validate_filename "$destname"; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Invalid destination filename"
+			json_dump
+			exit 0
+		fi
+		# Validate source path is an absolute path with no traversal
+		case "$filename" in
+			/*) : ;;
+			*) json_init; json_add_int "code" 1; json_add_string "error" "Invalid source path"; json_dump; exit 0 ;;
+		esac
+		case "$filename" in
+			*..*)  json_init; json_add_int "code" 1; json_add_string "error" "Invalid source path"; json_dump; exit 0 ;;
+		esac
+		if [ ! -f "$filename" ]; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Uploaded file not found"
+			json_dump
+			exit 0
+		fi
+		mkdir -p "$KO_DIR"
+		err=$(mv "$filename" "$KO_DIR/$destname" 2>&1)
+		rc=$?
+		json_init
+		json_add_int "code" "$rc"
+		[ "$rc" -ne 0 ] && json_add_string "error" "${err:-Failed to move file}"
+		json_dump
+		;;
+	list_firmwares)
+		json_init
+		json_add_array "firmwares"
+		for f in "$FW_DIR"/*; do
+			[ -f "$f" ] || continue
+			filename="${f##*/}"
+			size=$(wc -c < "$f" 2>/dev/null || echo 0)
+			link_name=""
+			for lnk in "$FW_LINK_DIR"/*; do
+				[ -L "$lnk" ] || continue
+				ltarget=$(readlink "$lnk" 2>/dev/null)
+				case "$ltarget" in
+					"$FW_DIR/$filename")
+						link_name="${lnk##*/}"
+						break
+						;;
+				esac
+			done
+			json_add_object ""
+			json_add_string "filename" "$filename"
+			json_add_int "size" "$size"
+			if [ -n "$link_name" ]; then
+				json_add_boolean "linked" 1
+				json_add_string "link_name" "$link_name"
+			else
+				json_add_boolean "linked" 0
+				json_add_string "link_name" ""
+			fi
+			json_close_object
+		done
+		json_close_array
+		json_dump
+		;;
+	move_uploaded_firmware)
+		json_load "$(cat)"
+		json_get_var filename filename
+		json_get_var destname destname
+		if ! _validate_fw_filename "$destname"; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Invalid destination filename"
+			json_dump
+			exit 0
+		fi
+		case "$filename" in
+			/*) : ;;
+			*) json_init; json_add_int "code" 1; json_add_string "error" "Invalid source path"; json_dump; exit 0 ;;
+		esac
+		case "$filename" in
+			*..*)  json_init; json_add_int "code" 1; json_add_string "error" "Invalid source path"; json_dump; exit 0 ;;
+		esac
+		if [ ! -f "$filename" ]; then
+			json_init
+			json_add_int "code" 1
+			json_add_string "error" "Uploaded file not found"
+			json_dump
+			exit 0
+		fi
+		mkdir -p "$FW_DIR"
+		err=$(mv "$filename" "$FW_DIR/$destname" 2>&1)
+		rc=$?
+		json_init
+		json_add_int "code" "$rc"
+		[ "$rc" -ne 0 ] && json_add_string "error" "${err:-Failed to move file}"
+		json_dump
+		;;
+	create_symlink)
+		json_load "$(cat)"
+		json_get_var filename filename
+		json_get_var linkname linkname
+		if ! _validate_fw_filename "$filename"; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Invalid filename"; json_dump; exit 0
+		fi
+		if ! _validate_fw_filename "$linkname"; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Invalid link name"; json_dump; exit 0
+		fi
+		if [ ! -f "$FW_DIR/$filename" ]; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Firmware file not found"; json_dump; exit 0
+		fi
+		mkdir -p "$FW_LINK_DIR"
+		ln -sf "$FW_DIR/$filename" "$FW_LINK_DIR/$linkname"
+		rc=$?
+		json_init
+		json_add_int "code" "$rc"
+		[ "$rc" -ne 0 ] && json_add_string "error" "Failed to create symlink"
+		json_dump
+		;;
+	remove_symlink)
+		json_load "$(cat)"
+		json_get_var linkname linkname
+		if ! _validate_fw_filename "$linkname"; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Invalid link name"; json_dump; exit 0
+		fi
+		target="$FW_LINK_DIR/$linkname"
+		if [ ! -L "$target" ]; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Not a symlink or not found"; json_dump; exit 0
+		fi
+		err=$(rm -f "$target" 2>&1)
+		rc=$?
+		json_init
+		json_add_int "code" "$rc"
+		[ "$rc" -ne 0 ] && json_add_string "error" "${err:-Failed to remove symlink}"
+		json_dump
+		;;
+	delete_firmware)
+		json_load "$(cat)"
+		json_get_var filename filename
+		if ! _validate_fw_filename "$filename"; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Invalid filename"; json_dump; exit 0
+		fi
+		target="$FW_DIR/$filename"
+		if [ ! -f "$target" ]; then
+			json_init; json_add_int "code" 1; json_add_string "error" "Firmware not found"; json_dump; exit 0
+		fi
+		# Remove any symlinks pointing to this file before deleting
+		fw_err=""
+		for lnk in "$FW_LINK_DIR"/*; do
+			[ -L "$lnk" ] || continue
+			ltarget=$(readlink "$lnk" 2>/dev/null)
+			case "$ltarget" in
+				"$FW_DIR/$filename")
+					if ! rm -f "$lnk"; then
+						fw_err="Failed to remove symlink ${lnk##*/}"
+					fi ;;
+			esac
+		done
+		if ! rm -f "$target"; then
+			fw_err="${fw_err:+$fw_err; }Failed to delete firmware file"
+		fi
+		json_init
+		if [ -n "$fw_err" ]; then
+			json_add_int "code" 1
+			json_add_string "error" "$fw_err"
+		else
+			json_add_int "code" 0
+		fi
+		json_dump
+		;;
+	smac_status)
+		json_init
+		if [ -f /proc/hgics/status ]; then
+			json_add_string "status" "$(cat /proc/hgics/status)"
+		else
+			json_add_string "status" ""
+		fi
+		json_dump
+		;;
+	fmac_status)
+		json_init
+		_status_file=""
+		_proc_dev=""
+		if [ -f /sys/module/hgicf/parameters/proc_dev ]; then
+			_proc_dev=$(cat /sys/module/hgicf/parameters/proc_dev 2>/dev/null)
+		fi
+		if [ -n "$_proc_dev" ] && [ "$_proc_dev" != "0" ]; then
+			_ifname_tpl=$(cat /sys/module/hgicf/parameters/ifname 2>/dev/null)
+			_prefix=$(echo "$_ifname_tpl" | sed 's/%[0-9]*[dsiux].*$//')
+			if [ -n "$_prefix" ]; then
+				for _netdev in /sys/class/net/${_prefix}*; do
+					[ -d "$_netdev" ] || continue
+					_devname="${_netdev##*/}"
+					if [ -f "/proc/${_devname}/status" ]; then
+						_status_file="/proc/${_devname}/status"
+						break
+					fi
+				done
+			fi
+		else
+			if [ -f /proc/hgicf/status ]; then
+				_status_file="/proc/hgicf/status"
+			fi
+		fi
+		if [ -n "$_status_file" ]; then
+			json_add_string "status" "$(cat "$_status_file")"
+		else
+			json_add_string "status" ""
+		fi
+		json_dump
+		;;
+	*)
+		echo '{}'
+		;;
+	esac
+	;;
+*)
+	echo '{}'
+	;;
+esac

@@ -1,0 +1,56 @@
+{
+    "admin/wifi-test/test-driver": {
+        "title": "Test Drivers",
+        "order": 10,
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-driver-mgr" ]
+        }
+    },
+    "admin/wifi-test/test-driver/modules": {
+        "title": "Modules",
+        "order": 10,
+        "action": {
+            "type": "view",
+            "path": "test-driver/modules"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-driver-mgr" ]
+        }
+    },
+    "admin/wifi-test/test-driver/firmwares": {
+        "title": "Firmwares",
+        "order": 20,
+        "action": {
+            "type": "view",
+            "path": "test-driver/firmwares"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-driver-mgr" ]
+        }
+    },
+    "admin/wifi-test/test-driver/smac-status": {
+        "title": "SMAC Driver Status",
+        "order": 30,
+        "action": {
+            "type": "view",
+            "path": "test-driver/smac-status"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-driver-mgr" ]
+        }
+    },
+    "admin/wifi-test/test-driver/fmac-status": {
+        "title": "FMAC Driver Status",
+        "order": 40,
+        "action": {
+            "type": "view",
+            "path": "test-driver/fmac-status"
+        },
+        "depends": {
+            "acl": [ "luci-app-wifi-test-driver-mgr" ]
+        }
+    }
+}
