@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -34,6 +35,9 @@
 #define MCPD_DEFAULT_TIMEOUT_MS 30000U
 #define MCPD_DEFAULT_MAX_OUTPUT (256U * 1024U)
 #define MCPD_DEFAULT_MAX_REQUEST (1024U * 1024U)
+#define MCPD_DEFAULT_UPGRADE_DIR "/tmp/openwrt-mcpd-upgrade"
+#define MCPD_DEFAULT_MAX_FIRMWARE (16U * 1024U * 1024U)
+#define MCPD_DEFAULT_FLASH_DELAY_MS 1500U
 #define MCPD_PROTOCOL_VERSION "2025-11-25"
 #define MCPD_SERVER_NAME "openwrt-mcpd"
 #define MCPD_SERVER_VERSION "0.1.0"
@@ -44,6 +48,9 @@ struct mcpd_config {
 	unsigned int timeout_ms;
 	size_t max_output_bytes;
 	size_t max_request_bytes;
+	char upgrade_dir[PATH_MAX];
+	size_t max_firmware_bytes;
+	unsigned int flash_delay_ms;
 };
 
 struct request_ctx {
@@ -221,6 +228,43 @@ static size_t json_get_size_default(json_object *obj, const char *key,
 	return (size_t)i;
 }
 
+static bool json_get_size_required(json_object *obj, const char *key, size_t *out)
+{
+	json_object *v;
+	int64_t i;
+
+	if (!json_object_object_get_ex(obj, key, &v) ||
+	    !json_object_is_type(v, json_type_int))
+		return false;
+
+	i = json_object_get_int64(v);
+	if (i < 0)
+		return false;
+	*out = (size_t)i;
+	return true;
+}
+
+static bool json_get_bool_default(json_object *obj, const char *key, bool def)
+{
+	json_object *v;
+
+	if (!json_object_object_get_ex(obj, key, &v))
+		return def;
+	return json_object_get_boolean(v);
+}
+
+static bool json_get_bool_required(json_object *obj, const char *key, bool *out)
+{
+	json_object *v;
+
+	if (!json_object_object_get_ex(obj, key, &v) ||
+	    !json_object_is_type(v, json_type_boolean))
+		return false;
+
+	*out = json_object_get_boolean(v);
+	return true;
+}
+
 static char *json_to_alloc_string(json_object *obj)
 {
 	const char *s = json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN);
@@ -343,6 +387,16 @@ static json_object *new_required_array(const char *a, const char *b, const char 
 	return arr;
 }
 
+static json_object *new_required_array4(const char *a, const char *b,
+					const char *c, const char *d)
+{
+	json_object *arr = new_required_array(a, b, c);
+
+	if (d)
+		json_object_array_add(arr, json_object_new_string(d));
+	return arr;
+}
+
 static json_object *tool_schema_shell(void)
 {
 	json_object *s = schema_object();
@@ -399,6 +453,69 @@ static json_object *tool_schema_device_guide(void)
 	json_object_object_add(topic, "enum", one_of);
 	json_object_object_add(props, "topic", topic);
 	json_object_object_add(s, "properties", props);
+	return s;
+}
+
+static json_object *tool_schema_firmware_upload_begin(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "upload_id", schema_string(true));
+	json_object_object_add(props, "total_bytes", schema_integer());
+	json_object_object_add(props, "sha256", schema_string(true));
+	json_object_object_add(s, "properties", props);
+	json_object_object_add(s, "required", new_required_array("upload_id", "total_bytes", "sha256"));
+	return s;
+}
+
+static json_object *tool_schema_firmware_upload_chunk(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "upload_id", schema_string(true));
+	json_object_object_add(props, "offset", schema_integer());
+	json_object_object_add(props, "data_base64", schema_string(true));
+	json_object_object_add(s, "properties", props);
+	json_object_object_add(s, "required", new_required_array("upload_id", "offset", "data_base64"));
+	return s;
+}
+
+static json_object *tool_schema_firmware_validate(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "upload_id", schema_string(true));
+	json_object_object_add(props, "keep_config", schema_boolean());
+	json_object_object_add(s, "properties", props);
+	json_object_object_add(s, "required", new_required_array("upload_id", NULL, NULL));
+	return s;
+}
+
+static json_object *tool_schema_firmware_flash(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "upload_id", schema_string(true));
+	json_object_object_add(props, "allow_reboot", schema_boolean());
+	json_object_object_add(props, "keep_config", schema_boolean());
+	json_object_object_add(props, "force", schema_boolean());
+	json_object_object_add(s, "properties", props);
+	json_object_object_add(s, "required", new_required_array4("upload_id", "allow_reboot", NULL, NULL));
+	return s;
+}
+
+static json_object *tool_schema_firmware_status(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "upload_id", schema_string(true));
+	json_object_object_add(s, "properties", props);
+	json_object_object_add(s, "required", new_required_array("upload_id", NULL, NULL));
 	return s;
 }
 
@@ -839,6 +956,415 @@ static json_object *proc_structured(struct proc_result *r)
 	return structured;
 }
 
+static bool write_all_fd(int fd, const void *data, size_t len)
+{
+	const unsigned char *p = data;
+
+	while (len) {
+		ssize_t n = write(fd, p, len);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (n == 0)
+			return false;
+		p += n;
+		len -= (size_t)n;
+	}
+	return true;
+}
+
+static bool read_small_file(const char *path, size_t max_len, char **out)
+{
+	int fd;
+	struct dynbuf b;
+	char tmp[1024];
+	bool ok = false;
+
+	*out = NULL;
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	dynbuf_init(&b);
+	for (;;) {
+		ssize_t n = read(fd, tmp, sizeof(tmp));
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (n == 0) {
+			ok = true;
+			break;
+		}
+		if (b.len + (size_t)n > max_len)
+			break;
+		if (!dynbuf_append(&b, tmp, (size_t)n))
+			break;
+	}
+	close(fd);
+
+	if (!ok) {
+		dynbuf_free(&b);
+		return false;
+	}
+	*out = b.data ? b.data : xstrdup("");
+	return *out != NULL;
+}
+
+static bool write_json_file(const char *path, json_object *obj)
+{
+	const char *s = json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN);
+	int fd;
+	bool ok;
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return false;
+	ok = write_all_fd(fd, s, strlen(s)) && write_all_fd(fd, "\n", 1);
+	if (close(fd) < 0)
+		ok = false;
+	return ok;
+}
+
+static json_object *read_json_file(const char *path)
+{
+	char *data;
+	json_object *obj;
+
+	if (!read_small_file(path, 1024U * 1024U, &data))
+		return NULL;
+	obj = json_tokener_parse(data);
+	free(data);
+	return obj;
+}
+
+static bool mkdir_p(const char *path, mode_t mode)
+{
+	char tmp[PATH_MAX];
+	size_t len;
+
+	if (!path || !path[0] || strlen(path) >= sizeof(tmp))
+		return false;
+
+	strcpy(tmp, path);
+	len = strlen(tmp);
+	if (len > 1 && tmp[len - 1] == '/')
+		tmp[len - 1] = '\0';
+
+	for (char *p = tmp + 1; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		if (mkdir(tmp, mode) < 0 && errno != EEXIST)
+			return false;
+		*p = '/';
+	}
+
+	if (mkdir(tmp, mode) < 0 && errno != EEXIST)
+		return false;
+	return true;
+}
+
+static bool ensure_upgrade_dir(struct mcpd_config *cfg)
+{
+	struct stat st;
+
+	if (!mkdir_p(cfg->upgrade_dir, 0700))
+		return false;
+	if (stat(cfg->upgrade_dir, &st) < 0)
+		return false;
+	return S_ISDIR(st.st_mode);
+}
+
+static bool valid_upload_id(const char *id)
+{
+	size_t len;
+
+	if (!id)
+		return false;
+	len = strlen(id);
+	if (!len || len > 64)
+		return false;
+	if (!strcmp(id, ".") || !strcmp(id, ".."))
+		return false;
+
+	for (size_t i = 0; i < len; i++) {
+		char c = id[i];
+
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+			continue;
+		return false;
+	}
+	return true;
+}
+
+static bool firmware_paths(struct mcpd_config *cfg, const char *upload_id,
+			   char *image, size_t image_len,
+			   char *meta, size_t meta_len,
+			   char *log, size_t log_len)
+{
+	if (!valid_upload_id(upload_id))
+		return false;
+
+	if (image && snprintf(image, image_len, "%s/%s.bin",
+			      cfg->upgrade_dir, upload_id) >= (int)image_len)
+		return false;
+	if (meta && snprintf(meta, meta_len, "%s/%s.json",
+			     cfg->upgrade_dir, upload_id) >= (int)meta_len)
+		return false;
+	if (log && snprintf(log, log_len, "%s/%s.log",
+			    cfg->upgrade_dir, upload_id) >= (int)log_len)
+		return false;
+	return true;
+}
+
+static bool is_sha256_hex(const char *s)
+{
+	if (!s || strlen(s) != 64)
+		return false;
+
+	for (size_t i = 0; i < 64; i++) {
+		char c = s[i];
+
+		if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+		    (c >= 'A' && c <= 'F'))
+			continue;
+		return false;
+	}
+	return true;
+}
+
+static bool starts_with_sha256_hex(const char *s)
+{
+	if (!s)
+		return false;
+
+	for (size_t i = 0; i < 64; i++) {
+		char c = s[i];
+
+		if (!c)
+			return false;
+		if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+		    (c >= 'A' && c <= 'F'))
+			continue;
+		return false;
+	}
+	return s[64] == '\0' || s[64] == ' ' || s[64] == '\t' || s[64] == '\n';
+}
+
+static void lowercase_sha256(char out[65], const char *in)
+{
+	for (size_t i = 0; i < 64; i++) {
+		char c = in[i];
+
+		if (c >= 'A' && c <= 'F')
+			c = (char)(c - 'A' + 'a');
+		out[i] = c;
+	}
+	out[64] = '\0';
+}
+
+static bool file_size(const char *path, size_t *out)
+{
+	struct stat st;
+
+	if (stat(path, &st) < 0 || st.st_size < 0)
+		return false;
+	*out = (size_t)st.st_size;
+	return true;
+}
+
+static bool meta_get_size(json_object *meta, const char *key, size_t *out)
+{
+	json_object *v;
+	int64_t i;
+
+	if (!json_object_object_get_ex(meta, key, &v) ||
+	    !json_object_is_type(v, json_type_int))
+		return false;
+	i = json_object_get_int64(v);
+	if (i < 0)
+		return false;
+	*out = (size_t)i;
+	return true;
+}
+
+static int meta_get_int(json_object *meta, const char *key, int def)
+{
+	json_object *v;
+
+	if (!json_object_object_get_ex(meta, key, &v) ||
+	    !json_object_is_type(v, json_type_int))
+		return def;
+	return json_object_get_int(v);
+}
+
+static bool meta_get_bool(json_object *meta, const char *key, bool def)
+{
+	json_object *v;
+
+	if (!json_object_object_get_ex(meta, key, &v))
+		return def;
+	return json_object_get_boolean(v);
+}
+
+static const char *meta_get_string(json_object *meta, const char *key)
+{
+	json_object *v;
+
+	if (!json_object_object_get_ex(meta, key, &v) ||
+	    !json_object_is_type(v, json_type_string))
+		return "";
+	return json_object_get_string(v);
+}
+
+static bool sha256_file(const char *path, char out[65], struct mcpd_config *cfg,
+			char *err, size_t err_len)
+{
+	char *argv[3];
+	struct proc_result r;
+	bool ok = false;
+	const char *s;
+
+	argv[0] = "sha256sum";
+	argv[1] = (char *)path;
+	argv[2] = NULL;
+	run_process(argv, NULL, cfg->timeout_ms, 4096, &r);
+
+	if (r.exit_code != 0 || r.timed_out) {
+		snprintf(err, err_len, "sha256sum failed: %s",
+			 r.stderr_data ? r.stderr_data : "");
+		goto out;
+	}
+
+	s = r.stdout_data ? r.stdout_data : "";
+	if (!starts_with_sha256_hex(s)) {
+		snprintf(err, err_len, "sha256sum output did not start with a SHA256 digest");
+		goto out;
+	}
+
+	lowercase_sha256(out, s);
+	ok = true;
+
+out:
+	proc_result_free(&r);
+	return ok;
+}
+
+static char *file_tail(const char *path, size_t max_len)
+{
+	int fd;
+	struct stat st;
+	off_t off = 0;
+	char *buf;
+	size_t len;
+	ssize_t n;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return xstrdup("");
+
+	if (fstat(fd, &st) < 0) {
+		close(fd);
+		return xstrdup("");
+	}
+	if (st.st_size > (off_t)max_len)
+		off = st.st_size - (off_t)max_len;
+	if (off && lseek(fd, off, SEEK_SET) < 0) {
+		close(fd);
+		return xstrdup("");
+	}
+
+	len = st.st_size > (off_t)max_len ? max_len : (size_t)st.st_size;
+	buf = calloc(1, len + 1);
+	if (!buf) {
+		close(fd);
+		return NULL;
+	}
+
+	n = read(fd, buf, len);
+	close(fd);
+	if (n < 0) {
+		free(buf);
+		return xstrdup("");
+	}
+	buf[n] = '\0';
+	return buf;
+}
+
+static bool validation_bool(json_object *validation, const char *key, bool def)
+{
+	json_object *v;
+
+	if (!validation || !json_object_object_get_ex(validation, key, &v))
+		return def;
+	return json_object_get_boolean(v);
+}
+
+static bool schedule_sysupgrade(const char *image, const char *log_path,
+				bool keep_config, bool force, unsigned int delay_ms,
+				pid_t *scheduled_pid)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0)
+		return false;
+
+	if (pid == 0) {
+		pid_t child;
+
+		if (setsid() < 0)
+			_exit(127);
+		child = fork();
+		if (child < 0)
+			_exit(127);
+		if (child > 0)
+			_exit(0);
+
+		if (delay_ms)
+			usleep(delay_ms * 1000U);
+
+		int nullfd = open("/dev/null", O_RDONLY);
+		if (nullfd >= 0) {
+			dup2(nullfd, STDIN_FILENO);
+			close(nullfd);
+		}
+
+		int logfd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (logfd >= 0) {
+			dup2(logfd, STDOUT_FILENO);
+			dup2(logfd, STDERR_FILENO);
+			close(logfd);
+		}
+
+		char *argv[6];
+		int i = 0;
+
+		argv[i++] = "/sbin/sysupgrade";
+		if (force)
+			argv[i++] = "-F";
+		if (!keep_config)
+			argv[i++] = "-n";
+		argv[i++] = (char *)image;
+		argv[i] = NULL;
+		execv(argv[0], argv);
+		_exit(127);
+	}
+
+	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+		;
+	if (scheduled_pid)
+		*scheduled_pid = pid;
+	return true;
+}
+
 static json_object *call_shell(json_object *args, struct mcpd_config *cfg)
 {
 	const char *cmd, *cwd = NULL;
@@ -1026,6 +1552,464 @@ static json_object *call_device_guide(json_object *args)
 	return tool_result(guide, structured, false);
 }
 
+static json_object *call_firmware_upload_begin(json_object *args, struct mcpd_config *cfg)
+{
+	const char *upload_id, *sha_arg;
+	char sha[65];
+	size_t total_bytes;
+	char image[PATH_MAX], meta_path[PATH_MAX], log_path[PATH_MAX];
+	int fd;
+	json_object *meta, *structured;
+	char text[256];
+
+	if (!json_get_string(args, "upload_id", &upload_id) || !valid_upload_id(upload_id))
+		return tool_error("firmware_upload_begin requires a safe upload_id using letters, digits, '.', '_' or '-'");
+	if (!json_get_size_required(args, "total_bytes", &total_bytes) || total_bytes == 0)
+		return tool_error("firmware_upload_begin requires positive integer total_bytes");
+	if (total_bytes > cfg->max_firmware_bytes)
+		return tool_error("firmware image exceeds configured max_firmware_bytes");
+	if (!json_get_string(args, "sha256", &sha_arg) || !is_sha256_hex(sha_arg))
+		return tool_error("firmware_upload_begin requires 64-character hex sha256");
+	lowercase_sha256(sha, sha_arg);
+
+	if (!ensure_upgrade_dir(cfg))
+		return tool_error("failed to create firmware upgrade directory");
+	if (!firmware_paths(cfg, upload_id, image, sizeof(image), meta_path, sizeof(meta_path),
+			    log_path, sizeof(log_path)))
+		return tool_error("failed to build firmware upload paths");
+
+	fd = open(image, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		snprintf(text, sizeof(text), "failed to create firmware image: %s", strerror(errno));
+		return tool_error(text);
+	}
+	if (close(fd) < 0) {
+		snprintf(text, sizeof(text), "failed to close firmware image: %s", strerror(errno));
+		return tool_error(text);
+	}
+	unlink(log_path);
+
+	meta = json_object_new_object();
+	json_object_object_add(meta, "upload_id", json_object_new_string(upload_id));
+	json_object_object_add(meta, "image_path", json_object_new_string(image));
+	json_object_object_add(meta, "log_path", json_object_new_string(log_path));
+	json_object_object_add(meta, "total_bytes", json_object_new_int64((int64_t)total_bytes));
+	json_object_object_add(meta, "received_bytes", json_object_new_int64(0));
+	json_object_object_add(meta, "expected_sha256", json_object_new_string(sha));
+	json_object_object_add(meta, "complete", json_object_new_boolean(false));
+	json_object_object_add(meta, "validated", json_object_new_boolean(false));
+	json_object_object_add(meta, "flash_scheduled", json_object_new_boolean(false));
+	if (!write_json_file(meta_path, meta)) {
+		json_object_put(meta);
+		return tool_error("failed to write firmware upload metadata");
+	}
+
+	structured = json_object_new_object();
+	json_object_object_add(structured, "upload_id", json_object_new_string(upload_id));
+	json_object_object_add(structured, "path", json_object_new_string(image));
+	json_object_object_add(structured, "total_bytes", json_object_new_int64((int64_t)total_bytes));
+	json_object_object_add(structured, "sha256", json_object_new_string(sha));
+	json_object_object_add(structured, "max_firmware_bytes",
+			       json_object_new_int64((int64_t)cfg->max_firmware_bytes));
+	snprintf(text, sizeof(text), "created firmware upload %s for %lu bytes",
+		 upload_id, (unsigned long)total_bytes);
+	json_object_put(meta);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_firmware_upload_chunk(json_object *args, struct mcpd_config *cfg)
+{
+	const char *upload_id, *data_b64, *expected_sha;
+	unsigned char *data = NULL;
+	size_t data_len = 0, offset, received, total, actual_size;
+	char image[PATH_MAX], meta_path[PATH_MAX], log_path[PATH_MAX];
+	char actual_sha[65], err[256], text[256];
+	json_object *meta, *structured;
+	int fd;
+	bool complete;
+
+	if (!json_get_string(args, "upload_id", &upload_id) || !valid_upload_id(upload_id))
+		return tool_error("firmware_upload_chunk requires a safe upload_id");
+	if (!json_get_size_required(args, "offset", &offset))
+		return tool_error("firmware_upload_chunk requires integer offset");
+	if (!json_get_string(args, "data_base64", &data_b64))
+		return tool_error("firmware_upload_chunk requires string data_base64");
+	if (!decode_base64(data_b64, &data, &data_len))
+		return tool_error("invalid base64 data");
+
+	if (!firmware_paths(cfg, upload_id, image, sizeof(image), meta_path, sizeof(meta_path),
+			    log_path, sizeof(log_path))) {
+		free(data);
+		return tool_error("failed to build firmware upload paths");
+	}
+	meta = read_json_file(meta_path);
+	if (!meta) {
+		free(data);
+		return tool_error("firmware upload metadata not found; call firmware_upload_begin first");
+	}
+	if (!meta_get_size(meta, "received_bytes", &received) ||
+	    !meta_get_size(meta, "total_bytes", &total)) {
+		json_object_put(meta);
+		free(data);
+		return tool_error("firmware upload metadata is invalid");
+	}
+	expected_sha = meta_get_string(meta, "expected_sha256");
+	if (!file_size(image, &actual_size)) {
+		json_object_put(meta);
+		free(data);
+		return tool_error("firmware image file is missing");
+	}
+	if (offset != received || actual_size != received) {
+		snprintf(text, sizeof(text), "offset mismatch: expected %lu, got %lu",
+			 (unsigned long)received, (unsigned long)offset);
+		json_object_put(meta);
+		free(data);
+		return tool_error(text);
+	}
+	if (data_len > total - received) {
+		json_object_put(meta);
+		free(data);
+		return tool_error("chunk exceeds declared firmware size");
+	}
+
+	fd = open(image, O_WRONLY);
+	if (fd < 0) {
+		snprintf(text, sizeof(text), "failed to open firmware image: %s", strerror(errno));
+		json_object_put(meta);
+		free(data);
+		return tool_error(text);
+	}
+	if (lseek(fd, (off_t)offset, SEEK_SET) < 0 || !write_all_fd(fd, data, data_len)) {
+		snprintf(text, sizeof(text), "failed to write firmware chunk: %s", strerror(errno));
+		close(fd);
+		json_object_put(meta);
+		free(data);
+		return tool_error(text);
+	}
+	if (close(fd) < 0) {
+		snprintf(text, sizeof(text), "failed to close firmware image: %s", strerror(errno));
+		json_object_put(meta);
+		free(data);
+		return tool_error(text);
+	}
+
+	received += data_len;
+	complete = received == total;
+	json_object_object_add(meta, "received_bytes", json_object_new_int64((int64_t)received));
+	json_object_object_add(meta, "complete", json_object_new_boolean(complete));
+	json_object_object_add(meta, "validated", json_object_new_boolean(false));
+
+	if (complete) {
+		if (!sha256_file(image, actual_sha, cfg, err, sizeof(err))) {
+			json_object_object_add(meta, "last_error", json_object_new_string(err));
+			write_json_file(meta_path, meta);
+			json_object_put(meta);
+			free(data);
+			return tool_error(err);
+		}
+		json_object_object_add(meta, "actual_sha256", json_object_new_string(actual_sha));
+		if (strcmp(actual_sha, expected_sha)) {
+			snprintf(text, sizeof(text), "firmware sha256 mismatch: expected %.64s got %.64s",
+				 expected_sha, actual_sha);
+			json_object_object_add(meta, "last_error", json_object_new_string(text));
+			write_json_file(meta_path, meta);
+			json_object_put(meta);
+			free(data);
+			return tool_error(text);
+		}
+	}
+
+	if (!write_json_file(meta_path, meta)) {
+		json_object_put(meta);
+		free(data);
+		return tool_error("failed to update firmware upload metadata");
+	}
+
+	structured = json_object_new_object();
+	json_object_object_add(structured, "upload_id", json_object_new_string(upload_id));
+	json_object_object_add(structured, "bytes_received", json_object_new_int64((int64_t)received));
+	json_object_object_add(structured, "total_bytes", json_object_new_int64((int64_t)total));
+	json_object_object_add(structured, "complete", json_object_new_boolean(complete));
+	if (complete)
+		json_object_object_add(structured, "sha256", json_object_new_string(expected_sha));
+	snprintf(text, sizeof(text), "received %lu/%lu firmware bytes",
+		 (unsigned long)received, (unsigned long)total);
+	json_object_put(meta);
+	free(data);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_firmware_validate(json_object *args, struct mcpd_config *cfg)
+{
+	const char *upload_id, *expected_sha;
+	size_t received, total, actual_size;
+	char image[PATH_MAX], meta_path[PATH_MAX], log_path[PATH_MAX];
+	char actual_sha[65], err[256], text[256];
+	char *validate_argv[3];
+	char *test_argv[5];
+	struct proc_result validate_r, test_r;
+	json_object *meta, *validation, *structured;
+	bool keep_config, image_valid, forceable, allow_backup;
+	int idx = 0;
+
+	if (!json_get_string(args, "upload_id", &upload_id) || !valid_upload_id(upload_id))
+		return tool_error("firmware_validate requires a safe upload_id");
+	keep_config = json_get_bool_default(args, "keep_config", false);
+
+	if (!firmware_paths(cfg, upload_id, image, sizeof(image), meta_path, sizeof(meta_path),
+			    log_path, sizeof(log_path)))
+		return tool_error("failed to build firmware upload paths");
+	meta = read_json_file(meta_path);
+	if (!meta)
+		return tool_error("firmware upload metadata not found; call firmware_upload_begin first");
+	if (!meta_get_size(meta, "received_bytes", &received) ||
+	    !meta_get_size(meta, "total_bytes", &total)) {
+		json_object_put(meta);
+		return tool_error("firmware upload metadata is invalid");
+	}
+	expected_sha = meta_get_string(meta, "expected_sha256");
+	if (received != total || !meta_get_bool(meta, "complete", false)) {
+		json_object_put(meta);
+		return tool_error("firmware upload is incomplete");
+	}
+	if (!file_size(image, &actual_size) || actual_size != total) {
+		json_object_put(meta);
+		return tool_error("firmware image size does not match upload metadata");
+	}
+	if (!sha256_file(image, actual_sha, cfg, err, sizeof(err))) {
+		json_object_put(meta);
+		return tool_error(err);
+	}
+	if (strcmp(actual_sha, expected_sha)) {
+		snprintf(text, sizeof(text), "firmware sha256 mismatch: expected %.64s got %.64s",
+			 expected_sha, actual_sha);
+		json_object_put(meta);
+		return tool_error(text);
+	}
+
+	validate_argv[0] = "/usr/libexec/validate_firmware_image";
+	validate_argv[1] = image;
+	validate_argv[2] = NULL;
+	run_process(validate_argv, NULL, cfg->timeout_ms, cfg->max_output_bytes, &validate_r);
+	validation = json_tokener_parse(validate_r.stdout_data ? validate_r.stdout_data : "");
+	if (!validation || !json_object_is_type(validation, json_type_object)) {
+		proc_result_free(&validate_r);
+		if (validation)
+			json_object_put(validation);
+		json_object_put(meta);
+		return tool_error("validate_firmware_image did not return JSON");
+	}
+
+	test_argv[idx++] = "/sbin/sysupgrade";
+	test_argv[idx++] = "-T";
+	if (!keep_config)
+		test_argv[idx++] = "-n";
+	test_argv[idx++] = image;
+	test_argv[idx] = NULL;
+	run_process(test_argv, NULL, cfg->timeout_ms, cfg->max_output_bytes, &test_r);
+
+	image_valid = validation_bool(validation, "valid", false);
+	forceable = validation_bool(validation, "forceable", false);
+	allow_backup = validation_bool(validation, "allow_backup", false);
+
+	json_object_object_add(meta, "actual_sha256", json_object_new_string(actual_sha));
+	json_object_object_add(meta, "validated", json_object_new_boolean(true));
+	json_object_object_add(meta, "validation_sha256", json_object_new_string(actual_sha));
+	json_object_object_add(meta, "image_valid", json_object_new_boolean(image_valid));
+	json_object_object_add(meta, "forceable", json_object_new_boolean(forceable));
+	json_object_object_add(meta, "allow_backup", json_object_new_boolean(allow_backup));
+	json_object_object_add(meta, "validated_keep_config", json_object_new_boolean(keep_config));
+	json_object_object_add(meta, "validate_exit_code", json_object_new_int(validate_r.exit_code));
+	json_object_object_add(meta, "validate_stderr",
+			       json_object_new_string(validate_r.stderr_data ? validate_r.stderr_data : ""));
+	json_object_object_add(meta, "sysupgrade_test_exit_code", json_object_new_int(test_r.exit_code));
+	json_object_object_add(meta, "sysupgrade_test_stdout",
+			       json_object_new_string(test_r.stdout_data ? test_r.stdout_data : ""));
+	json_object_object_add(meta, "sysupgrade_test_stderr",
+			       json_object_new_string(test_r.stderr_data ? test_r.stderr_data : ""));
+	json_object_object_add(meta, "validation", json_object_get(validation));
+	if (!write_json_file(meta_path, meta)) {
+		proc_result_free(&validate_r);
+		proc_result_free(&test_r);
+		json_object_put(validation);
+		json_object_put(meta);
+		return tool_error("failed to update firmware validation metadata");
+	}
+
+	structured = json_object_new_object();
+	json_object_object_add(structured, "upload_id", json_object_new_string(upload_id));
+	json_object_object_add(structured, "sha256", json_object_new_string(actual_sha));
+	json_object_object_add(structured, "valid", json_object_new_boolean(image_valid));
+	json_object_object_add(structured, "forceable", json_object_new_boolean(forceable));
+	json_object_object_add(structured, "allow_backup", json_object_new_boolean(allow_backup));
+	json_object_object_add(structured, "keep_config", json_object_new_boolean(keep_config));
+	json_object_object_add(structured, "validate", proc_structured(&validate_r));
+	json_object_object_add(structured, "sysupgrade_test", proc_structured(&test_r));
+	json_object_object_add(structured, "validation", json_object_get(validation));
+
+	snprintf(text, sizeof(text),
+		 "firmware validation complete: valid=%s forceable=%s allow_backup=%s sysupgrade_test_exit=%d",
+		 image_valid ? "true" : "false", forceable ? "true" : "false",
+		 allow_backup ? "true" : "false", test_r.exit_code);
+	proc_result_free(&validate_r);
+	proc_result_free(&test_r);
+	json_object_put(validation);
+	json_object_put(meta);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_firmware_flash(json_object *args, struct mcpd_config *cfg)
+{
+	const char *upload_id, *expected_sha, *validation_sha;
+	bool allow_reboot, keep_config, force;
+	size_t received, total, actual_size;
+	char image[PATH_MAX], meta_path[PATH_MAX], log_path[PATH_MAX];
+	char actual_sha[65], err[256], text[256];
+	json_object *meta, *structured, *command;
+	bool image_valid, forceable, allow_backup;
+	int test_exit;
+	pid_t pid = -1;
+
+	if (!json_get_string(args, "upload_id", &upload_id) || !valid_upload_id(upload_id))
+		return tool_error("firmware_flash requires a safe upload_id");
+	if (!json_get_bool_required(args, "allow_reboot", &allow_reboot) || !allow_reboot)
+		return tool_error("firmware_flash requires allow_reboot: true");
+	keep_config = json_get_bool_default(args, "keep_config", false);
+	force = json_get_bool_default(args, "force", false);
+
+	if (!firmware_paths(cfg, upload_id, image, sizeof(image), meta_path, sizeof(meta_path),
+			    log_path, sizeof(log_path)))
+		return tool_error("failed to build firmware upload paths");
+	meta = read_json_file(meta_path);
+	if (!meta)
+		return tool_error("firmware upload metadata not found");
+	if (!meta_get_size(meta, "received_bytes", &received) ||
+	    !meta_get_size(meta, "total_bytes", &total)) {
+		json_object_put(meta);
+		return tool_error("firmware upload metadata is invalid");
+	}
+	expected_sha = meta_get_string(meta, "expected_sha256");
+	if (received != total || !meta_get_bool(meta, "complete", false)) {
+		json_object_put(meta);
+		return tool_error("firmware upload is incomplete");
+	}
+	if (!meta_get_bool(meta, "validated", false)) {
+		json_object_put(meta);
+		return tool_error("firmware_flash requires prior firmware_validate");
+	}
+	if (!file_size(image, &actual_size) || actual_size != total) {
+		json_object_put(meta);
+		return tool_error("firmware image size does not match upload metadata");
+	}
+	if (!sha256_file(image, actual_sha, cfg, err, sizeof(err))) {
+		json_object_put(meta);
+		return tool_error(err);
+	}
+	if (strcmp(actual_sha, expected_sha)) {
+		snprintf(text, sizeof(text), "firmware sha256 mismatch: expected %.64s got %.64s",
+			 expected_sha, actual_sha);
+		json_object_put(meta);
+		return tool_error(text);
+	}
+	validation_sha = meta_get_string(meta, "validation_sha256");
+	if (strcmp(actual_sha, validation_sha)) {
+		json_object_put(meta);
+		return tool_error("firmware image changed since validation");
+	}
+
+	image_valid = meta_get_bool(meta, "image_valid", false);
+	forceable = meta_get_bool(meta, "forceable", false);
+	allow_backup = meta_get_bool(meta, "allow_backup", false);
+	test_exit = meta_get_int(meta, "sysupgrade_test_exit_code", 1);
+
+	if (keep_config && !allow_backup) {
+		json_object_put(meta);
+		return tool_error("validated image is incompatible with keeping config");
+	}
+	if (force && !forceable) {
+		json_object_put(meta);
+		return tool_error("force requested but validation reported image is not forceable");
+	}
+	if (!force && (!image_valid || test_exit != 0)) {
+		json_object_put(meta);
+		return tool_error("validated image is not flashable without force");
+	}
+	if (!schedule_sysupgrade(image, log_path, keep_config, force, cfg->flash_delay_ms, &pid)) {
+		snprintf(text, sizeof(text), "failed to schedule sysupgrade: %s", strerror(errno));
+		json_object_put(meta);
+		return tool_error(text);
+	}
+
+	json_object_object_add(meta, "flash_scheduled", json_object_new_boolean(true));
+	json_object_object_add(meta, "flash_keep_config", json_object_new_boolean(keep_config));
+	json_object_object_add(meta, "flash_force", json_object_new_boolean(force));
+	json_object_object_add(meta, "flash_delay_ms", json_object_new_int((int)cfg->flash_delay_ms));
+	write_json_file(meta_path, meta);
+
+	command = json_object_new_array();
+	json_object_array_add(command, json_object_new_string("/sbin/sysupgrade"));
+	if (force)
+		json_object_array_add(command, json_object_new_string("-F"));
+	if (!keep_config)
+		json_object_array_add(command, json_object_new_string("-n"));
+	json_object_array_add(command, json_object_new_string(image));
+
+	structured = json_object_new_object();
+	json_object_object_add(structured, "upload_id", json_object_new_string(upload_id));
+	json_object_object_add(structured, "scheduled", json_object_new_boolean(true));
+	json_object_object_add(structured, "expected_disconnect", json_object_new_boolean(true));
+	json_object_object_add(structured, "delay_ms", json_object_new_int((int)cfg->flash_delay_ms));
+	json_object_object_add(structured, "keep_config", json_object_new_boolean(keep_config));
+	json_object_object_add(structured, "force", json_object_new_boolean(force));
+	json_object_object_add(structured, "log_path", json_object_new_string(log_path));
+	json_object_object_add(structured, "command", command);
+	json_object_object_add(structured, "scheduler_pid", json_object_new_int((int)pid));
+
+	snprintf(text, sizeof(text), "scheduled sysupgrade in %u ms; MCP disconnect is expected",
+		 cfg->flash_delay_ms);
+	json_object_put(meta);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_firmware_status(json_object *args, struct mcpd_config *cfg)
+{
+	const char *upload_id;
+	size_t current_size = 0;
+	char image[PATH_MAX], meta_path[PATH_MAX], log_path[PATH_MAX];
+	char *tail;
+	json_object *meta, *structured;
+	char text[256];
+
+	if (!json_get_string(args, "upload_id", &upload_id) || !valid_upload_id(upload_id))
+		return tool_error("firmware_status requires a safe upload_id");
+	if (!firmware_paths(cfg, upload_id, image, sizeof(image), meta_path, sizeof(meta_path),
+			    log_path, sizeof(log_path)))
+		return tool_error("failed to build firmware upload paths");
+
+	meta = read_json_file(meta_path);
+	structured = json_object_new_object();
+	json_object_object_add(structured, "upload_id", json_object_new_string(upload_id));
+	json_object_object_add(structured, "exists", json_object_new_boolean(meta != NULL));
+	if (!meta) {
+		snprintf(text, sizeof(text), "firmware upload %s not found", upload_id);
+		return tool_result(text, structured, false);
+	}
+
+	file_size(image, &current_size);
+	tail = file_tail(log_path, 4096);
+	json_object_object_add(structured, "current_size", json_object_new_int64((int64_t)current_size));
+	json_object_object_add(structured, "metadata", json_object_get(meta));
+	json_object_object_add(structured, "log_tail", json_object_new_string(tail ? tail : ""));
+	snprintf(text, sizeof(text), "firmware upload %s: %lu bytes, complete=%s, validated=%s, flash_scheduled=%s",
+		 upload_id, (unsigned long)current_size,
+		 meta_get_bool(meta, "complete", false) ? "true" : "false",
+		 meta_get_bool(meta, "validated", false) ? "true" : "false",
+		 meta_get_bool(meta, "flash_scheduled", false) ? "true" : "false");
+	free(tail);
+	json_object_put(meta);
+	return tool_result(text, structured, false);
+}
+
 static json_object *handle_initialize(json_object *params)
 {
 	json_object *result = json_object_new_object();
@@ -1065,6 +2049,21 @@ static json_object *handle_tools_list(void)
 	json_object_array_add(tools, new_tool("device_guide",
 		"Return HugeIC development-board guidance as markdown.",
 		tool_schema_device_guide()));
+	json_object_array_add(tools, new_tool("firmware_upload_begin",
+		"Create or reset a bounded sysupgrade firmware upload by upload_id, total size, and SHA256.",
+		tool_schema_firmware_upload_begin()));
+	json_object_array_add(tools, new_tool("firmware_upload_chunk",
+		"Append a base64 firmware chunk at an exact byte offset and verify the final SHA256.",
+		tool_schema_firmware_upload_chunk()));
+	json_object_array_add(tools, new_tool("firmware_validate",
+		"Validate a completed sysupgrade image on the board and store a hash-tied validation marker.",
+		tool_schema_firmware_validate()));
+	json_object_array_add(tools, new_tool("firmware_flash",
+		"Schedule a delayed sysupgrade for a previously validated upload; requires allow_reboot: true.",
+		tool_schema_firmware_flash()));
+	json_object_array_add(tools, new_tool("firmware_status",
+		"Report firmware upload, validation, and scheduled flash state for an upload_id.",
+		tool_schema_firmware_status()));
 	json_object_object_add(result, "tools", tools);
 	return result;
 }
@@ -1092,6 +2091,16 @@ static json_object *handle_tools_call(json_object *params, struct mcpd_config *c
 		ret = call_ubus(args, cfg);
 	else if (!strcmp(name, "device_guide"))
 		ret = call_device_guide(args);
+	else if (!strcmp(name, "firmware_upload_begin"))
+		ret = call_firmware_upload_begin(args, cfg);
+	else if (!strcmp(name, "firmware_upload_chunk"))
+		ret = call_firmware_upload_chunk(args, cfg);
+	else if (!strcmp(name, "firmware_validate"))
+		ret = call_firmware_validate(args, cfg);
+	else if (!strcmp(name, "firmware_flash"))
+		ret = call_firmware_flash(args, cfg);
+	else if (!strcmp(name, "firmware_status"))
+		ret = call_firmware_status(args, cfg);
 	else
 		ret = tool_error("unknown tool name");
 
@@ -1215,7 +2224,7 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [-p port] [-e endpoint] [-t timeout_ms] [-o max_output_bytes] [-r max_request_bytes]\n",
+		"Usage: %s [-p port] [-e endpoint] [-t timeout_ms] [-o max_output_bytes] [-r max_request_bytes] [-U upgrade_dir] [-M max_firmware_bytes] [-D flash_delay_ms]\n",
 		prog);
 }
 
@@ -1229,8 +2238,12 @@ static int parse_args(int argc, char **argv, struct mcpd_config *cfg)
 	cfg->timeout_ms = MCPD_DEFAULT_TIMEOUT_MS;
 	cfg->max_output_bytes = MCPD_DEFAULT_MAX_OUTPUT;
 	cfg->max_request_bytes = MCPD_DEFAULT_MAX_REQUEST;
+	strncpy(cfg->upgrade_dir, MCPD_DEFAULT_UPGRADE_DIR, sizeof(cfg->upgrade_dir) - 1);
+	cfg->upgrade_dir[sizeof(cfg->upgrade_dir) - 1] = '\0';
+	cfg->max_firmware_bytes = MCPD_DEFAULT_MAX_FIRMWARE;
+	cfg->flash_delay_ms = MCPD_DEFAULT_FLASH_DELAY_MS;
 
-	while ((opt = getopt(argc, argv, "p:e:t:o:r:h")) != -1) {
+	while ((opt = getopt(argc, argv, "p:e:t:o:r:U:M:D:h")) != -1) {
 		char *end = NULL;
 		unsigned long v;
 
@@ -1264,6 +2277,24 @@ static int parse_args(int argc, char **argv, struct mcpd_config *cfg)
 			if (!optarg[0] || *end || v == 0)
 				return -1;
 			cfg->max_request_bytes = (size_t)v;
+			break;
+		case 'U':
+			if (optarg[0] != '/' || strlen(optarg) >= sizeof(cfg->upgrade_dir))
+				return -1;
+			strncpy(cfg->upgrade_dir, optarg, sizeof(cfg->upgrade_dir) - 1);
+			cfg->upgrade_dir[sizeof(cfg->upgrade_dir) - 1] = '\0';
+			break;
+		case 'M':
+			v = strtoul(optarg, &end, 10);
+			if (!optarg[0] || *end || v == 0)
+				return -1;
+			cfg->max_firmware_bytes = (size_t)v;
+			break;
+		case 'D':
+			v = strtoul(optarg, &end, 10);
+			if (!optarg[0] || *end || v > 60000)
+				return -1;
+			cfg->flash_delay_ms = (unsigned int)v;
 			break;
 		case 'h':
 		default:

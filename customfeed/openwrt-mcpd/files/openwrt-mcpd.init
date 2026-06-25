@@ -31,6 +31,9 @@ start_instance() {
 	append_arg "$cfg" timeout_ms "-t" "30000"
 	append_arg "$cfg" max_output_bytes "-o" "262144"
 	append_arg "$cfg" max_request_bytes "-r" "1048576"
+	append_arg "$cfg" upgrade_dir "-U" "/tmp/openwrt-mcpd-upgrade"
+	append_arg "$cfg" max_firmware_bytes "-M" "16777216"
+	append_arg "$cfg" flash_delay_ms "-D" "1500"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
