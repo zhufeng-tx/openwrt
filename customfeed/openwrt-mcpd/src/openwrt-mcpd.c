@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,6 +39,14 @@
 #define MCPD_DEFAULT_UPGRADE_DIR "/tmp/openwrt-mcpd-upgrade"
 #define MCPD_DEFAULT_MAX_FIRMWARE (16U * 1024U * 1024U)
 #define MCPD_DEFAULT_FLASH_DELAY_MS 1500U
+#define MCPD_DEFAULT_SERIAL_DEVICE "/dev/ttyS2"
+#define MCPD_DEFAULT_SERIAL_BAUD 9600U
+#define MCPD_DEFAULT_SERIAL_CAPTURE_DIR "/tmp/openwrt-mcpd-serial"
+#define MCPD_DEFAULT_MAX_SERIAL_CAPTURE (256U * 1024U)
+#define MCPD_DEFAULT_SERIAL_READ_TIMEOUT_MS 1000U
+#define MCPD_DEFAULT_SERIAL_CAPTURE_MS 60000U
+#define MCPD_MAX_SERIAL_CAPTURE_MS 300000U
+#define MCPD_MAX_CAPTURES 4
 #define MCPD_PROTOCOL_VERSION "2025-11-25"
 #define MCPD_SERVER_NAME "openwrt-mcpd"
 #define MCPD_SERVER_VERSION "0.1.0"
@@ -51,6 +60,10 @@ struct mcpd_config {
 	char upgrade_dir[PATH_MAX];
 	size_t max_firmware_bytes;
 	unsigned int flash_delay_ms;
+	char serial_device[PATH_MAX];
+	unsigned int serial_baud;
+	char serial_capture_dir[PATH_MAX];
+	size_t max_serial_capture_bytes;
 };
 
 struct request_ctx {
@@ -74,7 +87,28 @@ struct proc_result {
 	bool truncated;
 };
 
+struct serial_capture {
+	bool used;
+	bool running;
+	bool stop_requested;
+	char id[64];
+	char device[PATH_MAX];
+	char data_path[PATH_MAX];
+	char error_path[PATH_MAX];
+	unsigned int baud;
+	unsigned int duration_ms;
+	size_t max_bytes;
+	unsigned long long start_ms;
+	unsigned long long end_ms;
+	pid_t pid;
+	int exit_code;
+	bool timed_out;
+	bool truncated;
+};
+
 static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t capture_child_running = 1;
+static struct serial_capture captures[MCPD_MAX_CAPTURES];
 
 static void signal_handler(int signo)
 {
@@ -444,7 +478,7 @@ static json_object *tool_schema_device_guide(void)
 	json_object *props = json_object_new_object();
 	json_object *topic = json_object_new_object();
 	json_object *one_of = json_object_new_array();
-	const char *topics[] = { "overview", "drivers", "firmware", "hgpriv", "procfs", "fmac" };
+	const char *topics[] = { "overview", "drivers", "firmware", "hgpriv", "procfs", "fmac", "serial" };
 	size_t i;
 
 	json_object_object_add(topic, "type", json_object_new_string("string"));
@@ -519,6 +553,44 @@ static json_object *tool_schema_firmware_status(void)
 	return s;
 }
 
+static json_object *tool_schema_serial_exchange(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "write_text", schema_string(false));
+	json_object_object_add(props, "write_base64", schema_string(false));
+	json_object_object_add(props, "append_newline", schema_boolean());
+	json_object_object_add(props, "baud", schema_integer());
+	json_object_object_add(props, "read_timeout_ms", schema_integer());
+	json_object_object_add(props, "max_read_bytes", schema_integer());
+	json_object_object_add(s, "properties", props);
+	return s;
+}
+
+static json_object *tool_schema_serial_capture_start(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "baud", schema_integer());
+	json_object_object_add(props, "duration_ms", schema_integer());
+	json_object_object_add(props, "max_bytes", schema_integer());
+	json_object_object_add(s, "properties", props);
+	return s;
+}
+
+static json_object *tool_schema_capture_id(void)
+{
+	json_object *s = schema_object();
+	json_object *props = json_object_new_object();
+
+	json_object_object_add(props, "capture_id", schema_string(true));
+	json_object_object_add(s, "properties", props);
+	json_object_object_add(s, "required", new_required_array("capture_id", NULL, NULL));
+	return s;
+}
+
 static json_object *new_tool(const char *name, const char *description,
 				     json_object *schema)
 {
@@ -532,7 +604,7 @@ static json_object *new_tool(const char *name, const char *description,
 
 static const char *board_instructions(void)
 {
-	return "HugeIC MT7628AN development board helper. Driver modules are staged in /test_ko, firmware in /test_firmware, and /lib/firmware may contain symlinks into /test_firmware. The existing rpcd object is luci.test_driver. Use hgpriv <ifname> set key=value or get key for FMAC tuning; frequency values use MHz x10 units, e.g. 908 MHz -> 9080 and 908.5 MHz -> 9085, while freq_range bandwidth remains MHz. After loading hgicf.ko, inspect /proc/hgicf/status and related procfs nodes.";
+	return "HugeIC MT7628AN development board helper. Driver modules are staged in /test_ko, firmware in /test_firmware, and /lib/firmware may contain symlinks into /test_firmware. The existing rpcd object is luci.test_driver. UART2 is exposed as /dev/ttyS2 and the MCP serial tools default to 9600 baud. Use serial_capture_start/status/stop/read for bounded UART captures. Use hgpriv <ifname> set key=value or get key for FMAC tuning; frequency values use MHz x10 units, e.g. 908 MHz -> 9080 and 908.5 MHz -> 9085, while freq_range bandwidth remains MHz. After loading hgicf.ko, inspect /proc/hgicf/status and related procfs nodes.";
 }
 
 static const char *guide_for_topic(const char *topic)
@@ -545,7 +617,8 @@ static const char *guide_for_topic(const char *topic)
 		       "- `/test_firmware` stores firmware files.\n"
 		       "- `/lib/firmware` may contain symlinks into `/test_firmware`.\n"
 		       "- Existing rpcd object: `luci.test_driver`.\n\n"
-		       "Useful topics: `drivers`, `firmware`, `hgpriv`, `procfs`, `fmac`.\n"
+		       "Serial access: UART2 is `/dev/ttyS2`; MCP serial tools default to 9600 baud and support bounded captures.\n\n"
+		       "Useful topics: `drivers`, `firmware`, `hgpriv`, `procfs`, `fmac`, `serial`.\n"
 		       "Host driver source reference only: `/home/matt/hugeic/huge-ic-driver`; do not assume it exists on the device.\n";
 
 	if (!strcmp(topic, "drivers"))
@@ -599,7 +672,12 @@ static const char *guide_for_topic(const char *topic)
 		       "Remember the frequency conversion used by driver tools: MHz values become x10 integer units (`908` -> `9080`, `908.5` -> `9085`), while `freq_range` bandwidth remains MHz.\n"
 		       "For low-level procfs control after loading `hgicf.ko`, use `/proc/hgicf/iwpriv`, for example `echo \"wlan0 set txpower=15\" > /proc/hgicf/iwpriv`.\n";
 
-	return "# Unknown topic\n\nKnown topics: `overview`, `drivers`, `firmware`, `hgpriv`, `procfs`, `fmac`.\n";
+	if (!strcmp(topic, "serial"))
+		return "# UART2 serial capture\n\n"
+		       "The proven auxiliary serial path is UART2 at `/dev/ttyS2`. The MCP daemon defaults to 9600 baud and can override baud per serial tool call.\n\n"
+		       "Use `serial_exchange` for short write/read checks. Use `serial_capture_start` for longer bounded captures, then `serial_capture_status` to poll, `serial_capture_stop` to stop early and return data, or `serial_capture_read` to fetch a completed capture. Captured bytes are returned as base64 so binary output is safe.\n";
+
+	return "# Unknown topic\n\nKnown topics: `overview`, `drivers`, `firmware`, `hgpriv`, `procfs`, `fmac`, `serial`.\n";
 }
 
 static void proc_result_free(struct proc_result *r)
@@ -889,6 +967,158 @@ fail:
 	*out = NULL;
 	*out_len = 0;
 	return false;
+}
+
+static char *encode_base64(const unsigned char *data, size_t len)
+{
+	static const char table[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	char *out;
+	size_t out_len = ((len + 2) / 3) * 4;
+	size_t i, j = 0;
+
+	out = calloc(1, out_len + 1);
+	if (!out)
+		return NULL;
+
+	for (i = 0; i < len; i += 3) {
+		unsigned int v = (unsigned int)data[i] << 16;
+		size_t left = len - i;
+
+		if (left > 1)
+			v |= (unsigned int)data[i + 1] << 8;
+		if (left > 2)
+			v |= data[i + 2];
+
+		out[j++] = table[(v >> 18) & 0x3f];
+		out[j++] = table[(v >> 12) & 0x3f];
+		out[j++] = left > 1 ? table[(v >> 6) & 0x3f] : '=';
+		out[j++] = left > 2 ? table[v & 0x3f] : '=';
+	}
+
+	return out;
+}
+
+static bool read_file_limited(const char *path, size_t max_len,
+			      unsigned char **out, size_t *out_len)
+{
+	int fd;
+	struct dynbuf b;
+	char tmp[1024];
+	bool ok = false;
+
+	*out = NULL;
+	*out_len = 0;
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	dynbuf_init(&b);
+	for (;;) {
+		ssize_t n = read(fd, tmp, sizeof(tmp));
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (n == 0) {
+			ok = true;
+			break;
+		}
+		if (b.len + (size_t)n > max_len)
+			break;
+		if (!dynbuf_append(&b, tmp, (size_t)n))
+			break;
+	}
+	close(fd);
+
+	if (!ok) {
+		dynbuf_free(&b);
+		return false;
+	}
+
+	*out = (unsigned char *)b.data;
+	*out_len = b.len;
+	return true;
+}
+
+static bool baud_to_speed(unsigned int baud, speed_t *speed)
+{
+	switch (baud) {
+	case 300: *speed = B300; return true;
+	case 1200: *speed = B1200; return true;
+	case 2400: *speed = B2400; return true;
+	case 4800: *speed = B4800; return true;
+	case 9600: *speed = B9600; return true;
+	case 19200: *speed = B19200; return true;
+	case 38400: *speed = B38400; return true;
+	case 57600: *speed = B57600; return true;
+	case 115200: *speed = B115200; return true;
+#ifdef B230400
+	case 230400: *speed = B230400; return true;
+#endif
+#ifdef B460800
+	case 460800: *speed = B460800; return true;
+#endif
+#ifdef B921600
+	case 921600: *speed = B921600; return true;
+#endif
+	default:
+		return false;
+	}
+}
+
+static bool valid_abs_path(const char *path, size_t max_len)
+{
+	return path && path[0] == '/' && strlen(path) < max_len;
+}
+
+static int open_configured_serial(const char *device, unsigned int baud,
+				  char *err, size_t err_len)
+{
+	struct termios tio;
+	speed_t speed;
+	int fd;
+
+	if (!valid_abs_path(device, PATH_MAX)) {
+		snprintf(err, err_len, "serial device must be an absolute path");
+		return -1;
+	}
+	if (!baud_to_speed(baud, &speed)) {
+		snprintf(err, err_len, "unsupported serial baud %u", baud);
+		return -1;
+	}
+
+	fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+	if (fd < 0) {
+		snprintf(err, err_len, "failed to open %s: %s", device, strerror(errno));
+		return -1;
+	}
+
+	if (tcgetattr(fd, &tio) < 0) {
+		snprintf(err, err_len, "tcgetattr failed for %s: %s", device, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	tio.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+	tio.c_oflag &= ~OPOST;
+	tio.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+	tio.c_cflag &= ~(CSIZE | PARENB);
+	tio.c_cflag |= CS8 | CLOCAL | CREAD;
+	tio.c_cc[VMIN] = 0;
+	tio.c_cc[VTIME] = 0;
+	cfsetispeed(&tio, speed);
+	cfsetospeed(&tio, speed);
+
+	if (tcsetattr(fd, TCSANOW, &tio) < 0) {
+		snprintf(err, err_len, "tcsetattr failed for %s: %s", device, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	tcflush(fd, TCIOFLUSH);
+	return fd;
 }
 
 static bool parse_mode(json_object *args, mode_t *mode)
@@ -1298,6 +1528,266 @@ static char *file_tail(const char *path, size_t max_len)
 	return buf;
 }
 
+static void capture_child_signal_handler(int signo)
+{
+	(void)signo;
+	capture_child_running = 0;
+}
+
+static void write_error_text(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+	if (fd < 0)
+		return;
+	write_all_fd(fd, text, strlen(text));
+	close(fd);
+}
+
+static int serial_capture_child(const char *device, unsigned int baud,
+				unsigned int duration_ms, size_t max_bytes,
+				const char *data_path, const char *error_path)
+{
+	unsigned long long deadline = monotonic_ms() + duration_ms;
+	size_t total = 0;
+	char err[256] = "";
+	int fd, out_fd;
+
+	signal(SIGTERM, capture_child_signal_handler);
+	signal(SIGINT, capture_child_signal_handler);
+	signal(SIGPIPE, SIG_IGN);
+
+	fd = open_configured_serial(device, baud, err, sizeof(err));
+	if (fd < 0) {
+		write_error_text(error_path, err);
+		return 3;
+	}
+
+	out_fd = open(data_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (out_fd < 0) {
+		snprintf(err, sizeof(err), "failed to create capture file: %s", strerror(errno));
+		write_error_text(error_path, err);
+		close(fd);
+		return 3;
+	}
+
+	while (capture_child_running) {
+		unsigned long long now = monotonic_ms();
+		struct pollfd pfd;
+		int timeout;
+
+		if (now >= deadline)
+			break;
+		if (total >= max_bytes) {
+			close(out_fd);
+			close(fd);
+			return 2;
+		}
+
+		pfd.fd = fd;
+		pfd.events = POLLIN | POLLHUP | POLLERR;
+		pfd.revents = 0;
+		timeout = (deadline - now) > 200ULL ? 200 : (int)(deadline - now);
+
+		if (poll(&pfd, 1, timeout) < 0) {
+			if (errno == EINTR)
+				continue;
+			snprintf(err, sizeof(err), "serial poll failed: %s", strerror(errno));
+			write_error_text(error_path, err);
+			close(out_fd);
+			close(fd);
+			return 3;
+		}
+		if (!pfd.revents)
+			continue;
+		if (pfd.revents & (POLLERR | POLLHUP)) {
+			snprintf(err, sizeof(err), "serial device closed or reported an error");
+			write_error_text(error_path, err);
+			close(out_fd);
+			close(fd);
+			return 3;
+		}
+
+		for (;;) {
+			char buf[512];
+			size_t room = max_bytes - total;
+			ssize_t n;
+
+			if (!room) {
+				close(out_fd);
+				close(fd);
+				return 2;
+			}
+			if (room < sizeof(buf))
+				n = read(fd, buf, room);
+			else
+				n = read(fd, buf, sizeof(buf));
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+				snprintf(err, sizeof(err), "serial read failed: %s", strerror(errno));
+				write_error_text(error_path, err);
+				close(out_fd);
+				close(fd);
+				return 3;
+			}
+			if (n == 0)
+				break;
+			if (!write_all_fd(out_fd, buf, (size_t)n)) {
+				snprintf(err, sizeof(err), "failed to write capture file: %s", strerror(errno));
+				write_error_text(error_path, err);
+				close(out_fd);
+				close(fd);
+				return 3;
+			}
+			total += (size_t)n;
+		}
+	}
+
+	close(out_fd);
+	close(fd);
+	return capture_child_running ? 0 : 4;
+}
+
+static void update_capture_state(struct serial_capture *cap)
+{
+	int status;
+	pid_t r;
+
+	if (!cap->used || !cap->running)
+		return;
+
+	r = waitpid(cap->pid, &status, WNOHANG);
+	if (r == 0 || (r < 0 && errno == EINTR))
+		return;
+
+	cap->running = false;
+	cap->end_ms = monotonic_ms();
+	if (r < 0) {
+		cap->exit_code = -1;
+		return;
+	}
+
+	if (WIFEXITED(status))
+		cap->exit_code = WEXITSTATUS(status);
+	else if (WIFSIGNALED(status))
+		cap->exit_code = 128 + WTERMSIG(status);
+	else
+		cap->exit_code = -1;
+
+	cap->timed_out = cap->exit_code == 0;
+	cap->truncated = cap->exit_code == 2;
+}
+
+static struct serial_capture *find_capture(const char *id)
+{
+	for (size_t i = 0; i < MCPD_MAX_CAPTURES; i++) {
+		if (captures[i].used && !strcmp(captures[i].id, id)) {
+			update_capture_state(&captures[i]);
+			return &captures[i];
+		}
+	}
+	return NULL;
+}
+
+static struct serial_capture *alloc_capture_slot(void)
+{
+	for (size_t i = 0; i < MCPD_MAX_CAPTURES; i++) {
+		update_capture_state(&captures[i]);
+		if (!captures[i].used || !captures[i].running)
+			return &captures[i];
+	}
+	return NULL;
+}
+
+static bool capture_running_on_device(const char *device)
+{
+	for (size_t i = 0; i < MCPD_MAX_CAPTURES; i++) {
+		update_capture_state(&captures[i]);
+		if (captures[i].used && captures[i].running &&
+		    !strcmp(captures[i].device, device))
+			return true;
+	}
+	return false;
+}
+
+static const char *capture_state_text(struct serial_capture *cap)
+{
+	char *err;
+
+	if (cap->running)
+		return "running";
+	if (cap->stop_requested)
+		return "stopped";
+	if (cap->truncated)
+		return "truncated";
+	if (cap->timed_out)
+		return "completed";
+	err = file_tail(cap->error_path, 1);
+	if (err && err[0]) {
+		free(err);
+		return "error";
+	}
+	free(err);
+	return "completed";
+}
+
+static json_object *capture_structured(struct serial_capture *cap, bool include_data)
+{
+	json_object *structured = json_object_new_object();
+	unsigned long long now = cap->running ? monotonic_ms() : cap->end_ms;
+	size_t bytes = 0;
+	char *err;
+
+	file_size(cap->data_path, &bytes);
+	json_object_object_add(structured, "capture_id", json_object_new_string(cap->id));
+	json_object_object_add(structured, "device", json_object_new_string(cap->device));
+	json_object_object_add(structured, "baud", json_object_new_int((int)cap->baud));
+	json_object_object_add(structured, "state", json_object_new_string(capture_state_text(cap)));
+	json_object_object_add(structured, "running", json_object_new_boolean(cap->running));
+	json_object_object_add(structured, "timed_out", json_object_new_boolean(cap->timed_out));
+	json_object_object_add(structured, "stopped", json_object_new_boolean(cap->stop_requested && !cap->running));
+	json_object_object_add(structured, "truncated", json_object_new_boolean(cap->truncated));
+	json_object_object_add(structured, "duration_ms", json_object_new_int((int)cap->duration_ms));
+	json_object_object_add(structured, "elapsed_ms",
+			       json_object_new_int64((int64_t)(now - cap->start_ms)));
+	json_object_object_add(structured, "max_bytes", json_object_new_int64((int64_t)cap->max_bytes));
+	json_object_object_add(structured, "read_bytes", json_object_new_int64((int64_t)bytes));
+	json_object_object_add(structured, "exit_code", json_object_new_int(cap->exit_code));
+
+	err = file_tail(cap->error_path, 4096);
+	if (err && err[0])
+		json_object_object_add(structured, "error", json_object_new_string(err));
+	free(err);
+
+	if (include_data) {
+		unsigned char *data = NULL;
+		size_t len = 0;
+		char *b64 = NULL;
+
+		if (read_file_limited(cap->data_path, cap->max_bytes, &data, &len))
+			b64 = encode_base64(data, len);
+		json_object_object_add(structured, "read_base64",
+				       json_object_new_string(b64 ? b64 : ""));
+		free(data);
+		free(b64);
+	}
+
+	return structured;
+}
+
+static void cleanup_captures(void)
+{
+	for (size_t i = 0; i < MCPD_MAX_CAPTURES; i++) {
+		if (captures[i].used && captures[i].running) {
+			kill(captures[i].pid, SIGTERM);
+			update_capture_state(&captures[i]);
+		}
+	}
+}
+
 static bool validation_bool(json_object *validation, const char *key, bool def)
 {
 	json_object *v;
@@ -1543,13 +2033,303 @@ static json_object *call_device_guide(json_object *args)
 	json_get_string(args, "topic", &topic);
 	if (strcmp(topic, "overview") && strcmp(topic, "drivers") &&
 	    strcmp(topic, "firmware") && strcmp(topic, "hgpriv") &&
-	    strcmp(topic, "procfs") && strcmp(topic, "fmac"))
-		return tool_error("unknown device_guide topic; use overview, drivers, firmware, hgpriv, procfs, or fmac");
+	    strcmp(topic, "procfs") && strcmp(topic, "fmac") &&
+	    strcmp(topic, "serial"))
+		return tool_error("unknown device_guide topic; use overview, drivers, firmware, hgpriv, procfs, fmac, or serial");
 	guide = guide_for_topic(topic);
 	structured = json_object_new_object();
 	json_object_object_add(structured, "topic", json_object_new_string(topic));
 	json_object_object_add(structured, "markdown", json_object_new_string(guide));
 	return tool_result(guide, structured, false);
+}
+
+static json_object *call_serial_exchange(json_object *args, struct mcpd_config *cfg)
+{
+	const char *write_text = NULL, *write_b64 = NULL;
+	unsigned char *decoded = NULL;
+	size_t decoded_len = 0, written_len = 0;
+	struct dynbuf read_buf;
+	unsigned int baud, timeout_ms;
+	size_t max_read, stored_total = 0;
+	bool truncated = false, append_newline;
+	unsigned long long deadline;
+	char err[256] = "";
+	int fd;
+	char *read_b64;
+	json_object *structured;
+	char text[256];
+	bool has_write_text, has_write_b64;
+
+	has_write_text = json_get_string(args, "write_text", &write_text);
+	has_write_b64 = json_get_string(args, "write_base64", &write_b64);
+	if (has_write_text && has_write_b64)
+		return tool_error("serial_exchange accepts either write_text or write_base64, not both");
+
+	baud = json_get_uint_default(args, "baud", cfg->serial_baud, 0);
+	timeout_ms = json_get_uint_default(args, "read_timeout_ms",
+					   MCPD_DEFAULT_SERIAL_READ_TIMEOUT_MS, 60000U);
+	max_read = json_get_size_default(args, "max_read_bytes", 4096U,
+					 cfg->max_serial_capture_bytes);
+	append_newline = json_get_bool_default(args, "append_newline", false);
+
+	if (!max_read)
+		return tool_error("serial_exchange requires positive max_read_bytes");
+	if (write_b64 && !decode_base64(write_b64, &decoded, &decoded_len))
+		return tool_error("serial_exchange write_base64 is invalid");
+
+	fd = open_configured_serial(cfg->serial_device, baud, err, sizeof(err));
+	if (fd < 0) {
+		free(decoded);
+		return tool_error(err);
+	}
+
+	if (write_text) {
+		written_len += strlen(write_text);
+		if (!write_all_fd(fd, write_text, strlen(write_text))) {
+			snprintf(err, sizeof(err), "serial write failed: %s", strerror(errno));
+			close(fd);
+			free(decoded);
+			return tool_error(err);
+		}
+	}
+	if (decoded) {
+		written_len += decoded_len;
+		if (!write_all_fd(fd, decoded, decoded_len)) {
+			snprintf(err, sizeof(err), "serial write failed: %s", strerror(errno));
+			close(fd);
+			free(decoded);
+			return tool_error(err);
+		}
+	}
+	if (append_newline) {
+		written_len++;
+		if (!write_all_fd(fd, "\n", 1)) {
+			snprintf(err, sizeof(err), "serial newline write failed: %s", strerror(errno));
+			close(fd);
+			free(decoded);
+			return tool_error(err);
+		}
+	}
+	tcdrain(fd);
+
+	dynbuf_init(&read_buf);
+	deadline = monotonic_ms() + timeout_ms;
+	while (monotonic_ms() < deadline && stored_total < max_read) {
+		struct pollfd pfd;
+		unsigned long long now = monotonic_ms();
+		int wait_ms = (deadline - now) > 200ULL ? 200 : (int)(deadline - now);
+
+		pfd.fd = fd;
+		pfd.events = POLLIN | POLLHUP | POLLERR;
+		pfd.revents = 0;
+		if (poll(&pfd, 1, wait_ms) < 0) {
+			if (errno == EINTR)
+				continue;
+			snprintf(err, sizeof(err), "serial poll failed: %s", strerror(errno));
+			close(fd);
+			free(decoded);
+			dynbuf_free(&read_buf);
+			return tool_error(err);
+		}
+		if (!pfd.revents)
+			continue;
+		if (pfd.revents & (POLLERR | POLLHUP)) {
+			snprintf(err, sizeof(err), "serial device closed or reported an error");
+			close(fd);
+			free(decoded);
+			dynbuf_free(&read_buf);
+			return tool_error(err);
+		}
+		for (;;) {
+			char buf[512];
+			size_t room = max_read - stored_total;
+			ssize_t n = read(fd, buf, room < sizeof(buf) ? room : sizeof(buf));
+
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+				snprintf(err, sizeof(err), "serial read failed: %s", strerror(errno));
+				close(fd);
+				free(decoded);
+				dynbuf_free(&read_buf);
+				return tool_error(err);
+			}
+			if (n == 0)
+				break;
+			append_limited(&read_buf, buf, (size_t)n, &stored_total,
+				       max_read, &truncated);
+		}
+	}
+
+	close(fd);
+	read_b64 = encode_base64((unsigned char *)(read_buf.data ? read_buf.data : ""), read_buf.len);
+	structured = json_object_new_object();
+	json_object_object_add(structured, "device", json_object_new_string(cfg->serial_device));
+	json_object_object_add(structured, "baud", json_object_new_int((int)baud));
+	json_object_object_add(structured, "written_bytes", json_object_new_int64((int64_t)written_len));
+	json_object_object_add(structured, "read_bytes", json_object_new_int64((int64_t)read_buf.len));
+	json_object_object_add(structured, "read_base64", json_object_new_string(read_b64 ? read_b64 : ""));
+	json_object_object_add(structured, "timed_out", json_object_new_boolean(monotonic_ms() >= deadline));
+	json_object_object_add(structured, "truncated", json_object_new_boolean(truncated || stored_total >= max_read));
+	snprintf(text, sizeof(text), "serial_exchange %s %u baud: wrote %lu bytes, read %lu bytes",
+		 cfg->serial_device, baud, (unsigned long)written_len,
+		 (unsigned long)read_buf.len);
+	free(read_b64);
+	free(decoded);
+	dynbuf_free(&read_buf);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_serial_capture_start(json_object *args, struct mcpd_config *cfg)
+{
+	struct serial_capture *cap;
+	unsigned int baud, duration_ms;
+	size_t max_bytes, slot_idx;
+	speed_t speed;
+	pid_t pid;
+	char text[256];
+
+	baud = json_get_uint_default(args, "baud", cfg->serial_baud, 0);
+	duration_ms = json_get_uint_default(args, "duration_ms",
+					    MCPD_DEFAULT_SERIAL_CAPTURE_MS,
+					    MCPD_MAX_SERIAL_CAPTURE_MS);
+	max_bytes = json_get_size_default(args, "max_bytes", cfg->max_serial_capture_bytes,
+					  cfg->max_serial_capture_bytes);
+	if (!baud_to_speed(baud, &speed))
+		return tool_error("serial_capture_start received unsupported baud");
+	if (!duration_ms)
+		return tool_error("serial_capture_start requires positive duration_ms");
+	if (!max_bytes)
+		return tool_error("serial_capture_start requires positive max_bytes");
+	if (capture_running_on_device(cfg->serial_device))
+		return tool_error("a serial capture is already running on the configured device");
+	if (!mkdir_p(cfg->serial_capture_dir, 0700))
+		return tool_error("failed to create serial capture directory");
+
+	cap = alloc_capture_slot();
+	if (!cap)
+		return tool_error("no serial capture slots are available");
+	slot_idx = (size_t)(cap - captures);
+
+	memset(cap, 0, sizeof(*cap));
+	cap->used = true;
+	cap->running = true;
+	cap->pid = -1;
+	cap->baud = baud;
+	cap->duration_ms = duration_ms;
+	cap->max_bytes = max_bytes;
+	cap->start_ms = monotonic_ms();
+	cap->exit_code = -1;
+	strncpy(cap->device, cfg->serial_device, sizeof(cap->device) - 1);
+	snprintf(cap->id, sizeof(cap->id), "cap-%llu-%lu",
+		 cap->start_ms, (unsigned long)slot_idx);
+	snprintf(cap->data_path, sizeof(cap->data_path), "%s/%s.bin",
+		 cfg->serial_capture_dir, cap->id);
+	snprintf(cap->error_path, sizeof(cap->error_path), "%s/%s.err",
+		 cfg->serial_capture_dir, cap->id);
+	unlink(cap->data_path);
+	unlink(cap->error_path);
+
+	pid = fork();
+	if (pid < 0) {
+		cap->used = false;
+		snprintf(text, sizeof(text), "failed to start serial capture: %s", strerror(errno));
+		return tool_error(text);
+	}
+	if (pid == 0)
+		_exit(serial_capture_child(cap->device, cap->baud, cap->duration_ms,
+					   cap->max_bytes, cap->data_path, cap->error_path));
+
+	cap->pid = pid;
+	json_object *structured = capture_structured(cap, false);
+	snprintf(text, sizeof(text), "started serial capture %s on %s at %u baud for %u ms",
+		 cap->id, cap->device, cap->baud, cap->duration_ms);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_serial_capture_status(json_object *args)
+{
+	const char *id;
+	struct serial_capture *cap;
+	json_object *structured;
+	size_t bytes = 0;
+	char text[256];
+
+	if (!json_get_string(args, "capture_id", &id))
+		return tool_error("serial_capture_status requires capture_id");
+	cap = find_capture(id);
+	if (!cap)
+		return tool_error("serial capture not found");
+
+	file_size(cap->data_path, &bytes);
+	structured = capture_structured(cap, false);
+	snprintf(text, sizeof(text), "serial capture %s is %s with %lu bytes",
+		 cap->id, capture_state_text(cap), (unsigned long)bytes);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_serial_capture_read(json_object *args)
+{
+	const char *id;
+	struct serial_capture *cap;
+	json_object *structured;
+	size_t bytes = 0;
+	char text[256];
+
+	if (!json_get_string(args, "capture_id", &id))
+		return tool_error("serial_capture_read requires capture_id");
+	cap = find_capture(id);
+	if (!cap)
+		return tool_error("serial capture not found");
+	if (cap->running)
+		return tool_error("serial capture is still running; use serial_capture_status or serial_capture_stop");
+
+	file_size(cap->data_path, &bytes);
+	structured = capture_structured(cap, true);
+	snprintf(text, sizeof(text), "serial capture %s read returned %lu bytes",
+		 cap->id, (unsigned long)bytes);
+	return tool_result(text, structured, false);
+}
+
+static json_object *call_serial_capture_stop(json_object *args)
+{
+	const char *id;
+	struct serial_capture *cap;
+	json_object *structured;
+	size_t bytes = 0;
+	char text[256];
+
+	if (!json_get_string(args, "capture_id", &id))
+		return tool_error("serial_capture_stop requires capture_id");
+	cap = find_capture(id);
+	if (!cap)
+		return tool_error("serial capture not found");
+
+	if (cap->running) {
+		unsigned long long deadline;
+
+		cap->stop_requested = true;
+		kill(cap->pid, SIGTERM);
+		deadline = monotonic_ms() + 1000ULL;
+		while (cap->running && monotonic_ms() < deadline) {
+			update_capture_state(cap);
+			if (cap->running)
+				usleep(20000);
+		}
+		if (cap->running) {
+			kill(cap->pid, SIGKILL);
+			while (cap->running)
+				update_capture_state(cap);
+		}
+	}
+
+	file_size(cap->data_path, &bytes);
+	structured = capture_structured(cap, true);
+	snprintf(text, sizeof(text), "serial capture %s stopped with %lu bytes",
+		 cap->id, (unsigned long)bytes);
+	return tool_result(text, structured, false);
 }
 
 static json_object *call_firmware_upload_begin(json_object *args, struct mcpd_config *cfg)
@@ -2049,6 +2829,21 @@ static json_object *handle_tools_list(void)
 	json_object_array_add(tools, new_tool("device_guide",
 		"Return HugeIC development-board guidance as markdown.",
 		tool_schema_device_guide()));
+	json_object_array_add(tools, new_tool("serial_exchange",
+		"Use the configured UART for a short raw serial write/read exchange.",
+		tool_schema_serial_exchange()));
+	json_object_array_add(tools, new_tool("serial_capture_start",
+		"Start a bounded background raw serial capture on the configured UART.",
+		tool_schema_serial_capture_start()));
+	json_object_array_add(tools, new_tool("serial_capture_status",
+		"Report state and byte count for a serial capture.",
+		tool_schema_capture_id()));
+	json_object_array_add(tools, new_tool("serial_capture_stop",
+		"Stop a running serial capture early and return captured bytes as base64.",
+		tool_schema_capture_id()));
+	json_object_array_add(tools, new_tool("serial_capture_read",
+		"Return captured bytes as base64 for a completed serial capture.",
+		tool_schema_capture_id()));
 	json_object_array_add(tools, new_tool("firmware_upload_begin",
 		"Create or reset a bounded sysupgrade firmware upload by upload_id, total size, and SHA256.",
 		tool_schema_firmware_upload_begin()));
@@ -2091,6 +2886,16 @@ static json_object *handle_tools_call(json_object *params, struct mcpd_config *c
 		ret = call_ubus(args, cfg);
 	else if (!strcmp(name, "device_guide"))
 		ret = call_device_guide(args);
+	else if (!strcmp(name, "serial_exchange"))
+		ret = call_serial_exchange(args, cfg);
+	else if (!strcmp(name, "serial_capture_start"))
+		ret = call_serial_capture_start(args, cfg);
+	else if (!strcmp(name, "serial_capture_status"))
+		ret = call_serial_capture_status(args);
+	else if (!strcmp(name, "serial_capture_stop"))
+		ret = call_serial_capture_stop(args);
+	else if (!strcmp(name, "serial_capture_read"))
+		ret = call_serial_capture_read(args);
 	else if (!strcmp(name, "firmware_upload_begin"))
 		ret = call_firmware_upload_begin(args, cfg);
 	else if (!strcmp(name, "firmware_upload_chunk"))
@@ -2224,7 +3029,7 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [-p port] [-e endpoint] [-t timeout_ms] [-o max_output_bytes] [-r max_request_bytes] [-U upgrade_dir] [-M max_firmware_bytes] [-D flash_delay_ms]\n",
+		"Usage: %s [-p port] [-e endpoint] [-t timeout_ms] [-o max_output_bytes] [-r max_request_bytes] [-U upgrade_dir] [-M max_firmware_bytes] [-D flash_delay_ms] [-S serial_device] [-B serial_baud] [-C serial_capture_dir] [-N max_serial_capture_bytes]\n",
 		prog);
 }
 
@@ -2242,10 +3047,18 @@ static int parse_args(int argc, char **argv, struct mcpd_config *cfg)
 	cfg->upgrade_dir[sizeof(cfg->upgrade_dir) - 1] = '\0';
 	cfg->max_firmware_bytes = MCPD_DEFAULT_MAX_FIRMWARE;
 	cfg->flash_delay_ms = MCPD_DEFAULT_FLASH_DELAY_MS;
+	strncpy(cfg->serial_device, MCPD_DEFAULT_SERIAL_DEVICE, sizeof(cfg->serial_device) - 1);
+	cfg->serial_device[sizeof(cfg->serial_device) - 1] = '\0';
+	cfg->serial_baud = MCPD_DEFAULT_SERIAL_BAUD;
+	strncpy(cfg->serial_capture_dir, MCPD_DEFAULT_SERIAL_CAPTURE_DIR,
+		sizeof(cfg->serial_capture_dir) - 1);
+	cfg->serial_capture_dir[sizeof(cfg->serial_capture_dir) - 1] = '\0';
+	cfg->max_serial_capture_bytes = MCPD_DEFAULT_MAX_SERIAL_CAPTURE;
 
-	while ((opt = getopt(argc, argv, "p:e:t:o:r:U:M:D:h")) != -1) {
+	while ((opt = getopt(argc, argv, "p:e:t:o:r:U:M:D:S:B:C:N:h")) != -1) {
 		char *end = NULL;
 		unsigned long v;
+		speed_t speed;
 
 		switch (opt) {
 		case 'p':
@@ -2296,6 +3109,31 @@ static int parse_args(int argc, char **argv, struct mcpd_config *cfg)
 				return -1;
 			cfg->flash_delay_ms = (unsigned int)v;
 			break;
+		case 'S':
+			if (!valid_abs_path(optarg, sizeof(cfg->serial_device)))
+				return -1;
+			strncpy(cfg->serial_device, optarg, sizeof(cfg->serial_device) - 1);
+			cfg->serial_device[sizeof(cfg->serial_device) - 1] = '\0';
+			break;
+		case 'B':
+			v = strtoul(optarg, &end, 10);
+			if (!optarg[0] || *end || !baud_to_speed((unsigned int)v, &speed))
+				return -1;
+			cfg->serial_baud = (unsigned int)v;
+			break;
+		case 'C':
+			if (!valid_abs_path(optarg, sizeof(cfg->serial_capture_dir)))
+				return -1;
+			strncpy(cfg->serial_capture_dir, optarg,
+				sizeof(cfg->serial_capture_dir) - 1);
+			cfg->serial_capture_dir[sizeof(cfg->serial_capture_dir) - 1] = '\0';
+			break;
+		case 'N':
+			v = strtoul(optarg, &end, 10);
+			if (!optarg[0] || *end || v == 0)
+				return -1;
+			cfg->max_serial_capture_bytes = (size_t)v;
+			break;
 		case 'h':
 		default:
 			return -1;
@@ -2333,6 +3171,7 @@ int main(int argc, char **argv)
 	while (running)
 		sleep(1);
 
+	cleanup_captures();
 	MHD_stop_daemon(daemon);
 	return 0;
 }

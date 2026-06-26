@@ -34,6 +34,10 @@ start_instance() {
 	append_arg "$cfg" upgrade_dir "-U" "/tmp/openwrt-mcpd-upgrade"
 	append_arg "$cfg" max_firmware_bytes "-M" "16777216"
 	append_arg "$cfg" flash_delay_ms "-D" "1500"
+	append_arg "$cfg" serial_device "-S" "/dev/ttyS2"
+	append_arg "$cfg" serial_baud "-B" "9600"
+	append_arg "$cfg" serial_capture_dir "-C" "/tmp/openwrt-mcpd-serial"
+	append_arg "$cfg" max_serial_capture_bytes "-N" "262144"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
