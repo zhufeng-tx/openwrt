@@ -174,10 +174,19 @@ commit_managed_packages() {
 }
 
 reload_services() {
-	/etc/init.d/network reload || return 1
-	/etc/init.d/dnsmasq restart || return 1
-	/etc/init.d/odhcpd restart || return 1
-	/etc/init.d/firewall reload || return 1
+	mkdir -p "$STATE_DIR"
+	for action in \
+		"network reload" \
+		"dnsmasq restart" \
+		"odhcpd restart" \
+		"firewall reload"; do
+		set -- $action
+		service_log="$STATE_DIR/service-$1-$2.log"
+		if ! /etc/init.d/"$1" "$2" >"$service_log" 2>&1; then
+			log_error "$1 $2 failed; see $service_log"
+			return 1
+		fi
+	done
 }
 
 rollback() {
