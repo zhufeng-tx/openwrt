@@ -1,0 +1,43 @@
+#!/bin/sh
+
+# shellcheck source=/dev/null
+. /usr/share/libubox/jshn.sh
+
+HELPER="/usr/sbin/ipv6-test-mode"
+
+case "$1" in
+list)
+	echo '{"get_status":{},"apply":{"mode":"String","prefix":"String"},"disable":{}}'
+	;;
+call)
+	case "$2" in
+	get_status)
+		"$HELPER" status
+		;;
+	apply)
+		mode=""
+		prefix=""
+		json_load "$(cat)"
+		json_get_var mode mode
+		json_get_var prefix prefix
+		output="$("$HELPER" apply "$mode" "$prefix")"
+		if [ -n "$output" ]; then
+			printf '%s\n' "$output"
+		else
+			"$HELPER" status
+		fi
+		;;
+	disable)
+		output="$("$HELPER" disable)"
+		if [ -n "$output" ]; then
+			printf '%s\n' "$output"
+		else
+			"$HELPER" status
+		fi
+		;;
+	*)
+		echo '{"ok":false,"error":"Unknown method"}'
+		;;
+	esac
+	;;
+esac

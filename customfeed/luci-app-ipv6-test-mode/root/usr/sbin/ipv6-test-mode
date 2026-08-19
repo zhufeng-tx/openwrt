@@ -1,0 +1,360 @@
+#!/bin/sh
+
+# shellcheck source=/dev/null
+. /usr/share/libubox/jshn.sh
+
+APP_CONFIG="ipv6test"
+APP_SECTION="main"
+DEFAULT_MODE="stateless"
+DEFAULT_PREFIX="fd42:6970:7636:1::/64"
+STATE_DIR="/tmp/ipv6-test-mode"
+LAST_ERROR_FILE="$STATE_DIR/last_error"
+MANAGED_PACKAGES="network dhcp firewall $APP_CONFIG"
+
+log_error() {
+	logger -t ipv6-test-mode "$1"
+}
+
+set_last_error() {
+	mkdir -p "$STATE_DIR"
+	printf '%s\n' "$1" > "$LAST_ERROR_FILE"
+	log_error "$1"
+}
+
+clear_last_error() {
+	rm -f "$LAST_ERROR_FILE"
+}
+
+read_last_error() {
+	[ -r "$LAST_ERROR_FILE" ] && sed -n '1p' "$LAST_ERROR_FILE"
+}
+
+validate_mode() {
+	case "$1" in
+	stateless|stateful) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+normalize_prefix() {
+	printf '%s' "$1" | tr 'A-F' 'a-f'
+}
+
+validate_prefix() {
+	printf '%s\n' "$1" | grep -Eq '^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){3}::/64$'
+}
+
+derive_addresses() {
+	PREFIX_BASE="${1%::/64}"
+	ROUTER_ADDRESS="${PREFIX_BASE}::1"
+}
+
+snapshot_create() {
+	SNAPSHOT_DIR="$(mktemp -d /tmp/ipv6-test-mode.XXXXXX)" || return 1
+	for package in $MANAGED_PACKAGES; do
+		[ -f "/etc/config/$package" ] || return 1
+		cp "/etc/config/$package" "$SNAPSHOT_DIR/$package" || return 1
+	done
+}
+
+snapshot_restore() {
+	[ -n "$SNAPSHOT_DIR" ] && [ -d "$SNAPSHOT_DIR" ] || return 1
+	for package in $MANAGED_PACKAGES; do
+		uci -q revert "$package"
+		cp "$SNAPSHOT_DIR/$package" "/etc/config/$package" || return 1
+	done
+}
+
+snapshot_remove() {
+	[ -n "$SNAPSHOT_DIR" ] && [ -d "$SNAPSHOT_DIR" ] && rm -rf "$SNAPSHOT_DIR"
+	SNAPSHOT_DIR=""
+}
+
+ensure_base_sections() {
+	uci -q get network.lan >/dev/null || return 1
+	uci -q get 'dhcp.@dnsmasq[0]' >/dev/null || return 1
+
+	if ! uci -q get dhcp.lan >/dev/null; then
+		uci -q set dhcp.lan='dhcp' || return 1
+		uci -q set dhcp.lan.interface='lan' || return 1
+	fi
+
+	uci -q get firewall.@defaults[0] >/dev/null || return 1
+	return 0
+}
+
+configure_common() {
+	prefix="$1"
+	derive_addresses "$prefix"
+
+	uci -q delete network.lan.ip6assign
+	uci -q delete network.lan.ip6addr
+	uci -q add_list network.lan.ip6addr="$ROUTER_ADDRESS/64" || return 1
+
+	uci -q delete dhcp.lan.ignore
+	uci -q set dhcp.lan.interface='lan' || return 1
+	uci -q set dhcp.lan.dhcpv4='disabled' || return 1
+	uci -q set dhcp.lan.dhcpv6='server' || return 1
+	uci -q set dhcp.lan.ra='server' || return 1
+	uci -q set dhcp.lan.ra_default='1' || return 1
+	uci -q set dhcp.lan.ra_dns='0' || return 1
+	uci -q delete dhcp.lan.ra_flags
+	uci -q delete dhcp.lan.dns
+	uci -q add_list dhcp.lan.dns="$ROUTER_ADDRESS" || return 1
+
+	uci -q set 'dhcp.@dnsmasq[0].noresolv=1' || return 1
+	uci -q set 'dhcp.@dnsmasq[0].localservice=1' || return 1
+	uci -q set 'dhcp.@dnsmasq[0].domainneeded=1' || return 1
+	uci -q delete 'dhcp.@dnsmasq[0].server'
+
+	uci -q set dhcp.ipv6_test_router='domain' || return 1
+	uci -q set dhcp.ipv6_test_router.name='router.ipv6.test' || return 1
+	uci -q set dhcp.ipv6_test_router.ip="$ROUTER_ADDRESS" || return 1
+
+	uci -q set firewall.ipv6_test_block='rule' || return 1
+	uci -q set firewall.ipv6_test_block.name='IPv6 test mode: block forwarded traffic' || return 1
+	uci -q set firewall.ipv6_test_block.src='lan' || return 1
+	uci -q set firewall.ipv6_test_block.dest='*' || return 1
+	uci -q set firewall.ipv6_test_block.proto='all' || return 1
+	uci -q set firewall.ipv6_test_block.family='ipv6' || return 1
+	uci -q set firewall.ipv6_test_block.target='REJECT' || return 1
+	uci -q set firewall.ipv6_test_block.enabled='1' || return 1
+}
+
+configure_enabled() {
+	mode="$1"
+	prefix="$2"
+
+	ensure_base_sections || return 1
+	configure_common "$prefix" || return 1
+
+	case "$mode" in
+	stateless)
+		uci -q set dhcp.lan.ra_slaac='1' || return 1
+		uci -q add_list dhcp.lan.ra_flags='other-config' || return 1
+		;;
+	stateful)
+		uci -q set dhcp.lan.ra_slaac='0' || return 1
+		uci -q add_list dhcp.lan.ra_flags='managed-config' || return 1
+		;;
+	esac
+
+	uci -q set "$APP_CONFIG.$APP_SECTION.initialized=1" || return 1
+	uci -q set "$APP_CONFIG.$APP_SECTION.enabled=1" || return 1
+	uci -q set "$APP_CONFIG.$APP_SECTION.mode=$mode" || return 1
+	uci -q set "$APP_CONFIG.$APP_SECTION.prefix=$prefix" || return 1
+}
+
+configure_disabled() {
+	ensure_base_sections || return 1
+
+	uci -q delete network.lan.ip6assign
+	uci -q delete network.lan.ip6addr
+
+	uci -q delete dhcp.lan.ignore
+	uci -q set dhcp.lan.interface='lan' || return 1
+	uci -q set dhcp.lan.dhcpv4='disabled' || return 1
+	uci -q set dhcp.lan.dhcpv6='disabled' || return 1
+	uci -q set dhcp.lan.ra='disabled' || return 1
+	uci -q set dhcp.lan.ra_slaac='0' || return 1
+	uci -q set dhcp.lan.ra_dns='0' || return 1
+	uci -q delete dhcp.lan.ra_flags
+	uci -q delete dhcp.lan.dns
+	uci -q delete dhcp.ipv6_test_router
+	uci -q delete firewall.ipv6_test_block
+
+	uci -q set "$APP_CONFIG.$APP_SECTION.initialized=1" || return 1
+	uci -q set "$APP_CONFIG.$APP_SECTION.enabled=0" || return 1
+}
+
+commit_managed_packages() {
+	for package in $MANAGED_PACKAGES; do
+		uci -q commit "$package" || return 1
+	done
+}
+
+reload_services() {
+	/etc/init.d/network reload || return 1
+	/etc/init.d/dnsmasq restart || return 1
+	/etc/init.d/odhcpd restart || return 1
+	/etc/init.d/firewall reload || return 1
+}
+
+rollback() {
+	snapshot_restore || return 1
+	reload_services >/dev/null 2>&1
+}
+
+service_running() {
+	/etc/init.d/"$1" running >/dev/null 2>&1
+}
+
+status_json() {
+	enabled="$(uci -q get "$APP_CONFIG.$APP_SECTION.enabled")"
+	mode="$(uci -q get "$APP_CONFIG.$APP_SECTION.mode")"
+	prefix="$(normalize_prefix "$(uci -q get "$APP_CONFIG.$APP_SECTION.prefix")")"
+	[ "$enabled" = "1" ] || enabled=0
+	validate_mode "$mode" || mode="$DEFAULT_MODE"
+	validate_prefix "$prefix" || prefix="$DEFAULT_PREFIX"
+	derive_addresses "$prefix"
+
+	address_active=0
+	odhcpd_running=0
+	dnsmasq_running=0
+	firewall_running=0
+	forwarding_blocked=0
+
+	ip -6 addr show 2>/dev/null | grep -Fq "inet6 $ROUTER_ADDRESS/64 " && address_active=1
+	service_running odhcpd && odhcpd_running=1
+	service_running dnsmasq && dnsmasq_running=1
+	nft list table inet fw4 >/dev/null 2>&1 && firewall_running=1
+	if [ "$firewall_running" = "1" ] && \
+		nft list table inet fw4 2>/dev/null | grep -Fq 'IPv6 test mode: block forwarded traffic'; then
+		forwarding_blocked=1
+	fi
+
+	if [ "$enabled" = "1" ] && [ "$address_active" = "1" ] && \
+		[ "$odhcpd_running" = "1" ] && [ "$dnsmasq_running" = "1" ] && \
+		[ "$forwarding_blocked" = "1" ]; then
+		ok=1
+		active_mode="$mode"
+	elif [ "$enabled" = "0" ]; then
+		ok=1
+		active_mode="disabled"
+	else
+		ok=0
+		active_mode="degraded"
+	fi
+
+	case "$mode" in
+	stateful) ra_flags="A=0 O=0 M=1" ;;
+	*) ra_flags="A=1 O=1 M=0" ;;
+	esac
+
+	json_init
+	json_add_boolean ok "$ok"
+	json_add_boolean enabled "$enabled"
+	json_add_string mode "$mode"
+	json_add_string active_mode "$active_mode"
+	json_add_string prefix "$prefix"
+	json_add_string router_address "$ROUTER_ADDRESS"
+	json_add_string dns_address "$ROUTER_ADDRESS"
+	json_add_string dns_name "router.ipv6.test"
+	json_add_string ra_flags "$ra_flags"
+	json_add_boolean default_gateway "$enabled"
+	json_add_boolean address_active "$address_active"
+	json_add_boolean odhcpd_running "$odhcpd_running"
+	json_add_boolean dnsmasq_running "$dnsmasq_running"
+	json_add_boolean firewall_running "$firewall_running"
+	json_add_boolean forwarding_blocked "$forwarding_blocked"
+	json_add_string client_action "Reconnect or renew the client after changing modes."
+	json_add_string error "$(read_last_error)"
+	json_dump
+}
+
+apply_enabled() {
+	mode="$1"
+	prefix="$(normalize_prefix "$2")"
+	do_reload="$3"
+
+	if ! validate_mode "$mode"; then
+		set_last_error "Mode must be stateless or stateful."
+		status_json
+		return 1
+	fi
+	if ! validate_prefix "$prefix"; then
+		set_last_error "Prefix must use normalized ULA /64 form: fdxx:xxxx:xxxx:xxxx::/64."
+		status_json
+		return 1
+	fi
+
+	if [ "$do_reload" = "1" ]; then
+		snapshot_create || {
+			snapshot_remove
+			set_last_error "Could not create a configuration rollback snapshot."
+			status_json
+			return 1
+		}
+	fi
+
+	if ! configure_enabled "$mode" "$prefix" || ! commit_managed_packages; then
+		[ "$do_reload" = "1" ] && rollback
+		snapshot_remove
+		set_last_error "Could not save the IPv6 test configuration."
+		status_json
+		return 1
+	fi
+
+	if [ "$do_reload" = "1" ] && ! reload_services; then
+		rollback
+		snapshot_remove
+		set_last_error "A network service rejected the new configuration; the previous configuration was restored."
+		status_json
+		return 1
+	fi
+
+	snapshot_remove
+	clear_last_error
+	status_json
+}
+
+apply_disabled() {
+	do_reload="$1"
+
+	if [ "$do_reload" = "1" ]; then
+		snapshot_create || {
+			snapshot_remove
+			set_last_error "Could not create a configuration rollback snapshot."
+			status_json
+			return 1
+		}
+	fi
+
+	if ! configure_disabled || ! commit_managed_packages; then
+		[ "$do_reload" = "1" ] && rollback
+		snapshot_remove
+		set_last_error "Could not disable IPv6 test mode."
+		status_json
+		return 1
+	fi
+
+	if [ "$do_reload" = "1" ] && ! reload_services; then
+		rollback
+		snapshot_remove
+		set_last_error "A network service rejected the disabled configuration; the previous configuration was restored."
+		status_json
+		return 1
+	fi
+
+	snapshot_remove
+	clear_last_error
+	status_json
+}
+
+case "$1" in
+apply)
+	apply_enabled "$2" "$3" 1
+	;;
+disable)
+	apply_disabled 1
+	;;
+seed)
+	apply_enabled "$DEFAULT_MODE" "$DEFAULT_PREFIX" 0 >/dev/null
+	;;
+boot)
+	if [ "$(uci -q get "$APP_CONFIG.$APP_SECTION.enabled")" = "1" ]; then
+		apply_enabled \
+			"$(uci -q get "$APP_CONFIG.$APP_SECTION.mode")" \
+			"$(uci -q get "$APP_CONFIG.$APP_SECTION.prefix")" 1
+	else
+		apply_disabled 1
+	fi
+	;;
+status)
+	status_json
+	;;
+*)
+	echo "Usage: $0 {apply <stateless|stateful> <ula-prefix/64>|disable|seed|boot|status}" >&2
+	exit 2
+	;;
+esac

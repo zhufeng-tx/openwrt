@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+# shellcheck disable=SC2034
+START=95
+STOP=05
+
+start() {
+	if ! /usr/sbin/ipv6-test-mode boot >/dev/null 2>&1; then
+		logger -t ipv6-test-mode "failed to apply saved IPv6 test mode"
+		return 1
+	fi
+}
+
+reload() {
+	start
+}
+
+stop() {
+	# Preserve the selected mode during shutdown. The explicit disable action
+	# owns runtime teardown and persistence.
+	return 0
+}

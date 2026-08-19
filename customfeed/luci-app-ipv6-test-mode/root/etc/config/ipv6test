@@ -1,0 +1,5 @@
+config test 'main'
+	option initialized '0'
+	option enabled '1'
+	option mode 'stateless'
+	option prefix 'fd42:6970:7636:1::/64'

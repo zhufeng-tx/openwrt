@@ -1,0 +1,15 @@
+{
+    "luci-app-ipv6-test-mode": {
+        "description": "Manage the isolated IPv6 test environment",
+        "read": {
+            "ubus": {
+                "luci.ipv6_test": [ "get_status" ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "luci.ipv6_test": [ "apply", "disable" ]
+            }
+        }
+    }
+}

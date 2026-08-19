@@ -1,0 +1,5 @@
+#!/bin/sh
+
+[ "$(uci -q get ipv6test.main.initialized)" = "1" ] && exit 0
+
+/usr/sbin/ipv6-test-mode seed >/dev/null 2>&1
