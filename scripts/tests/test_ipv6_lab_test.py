@@ -34,6 +34,39 @@ class ParserTests(unittest.TestCase):
     def test_firewall_counter(self):
         self.assertEqual(42, LAB.parse_firewall_packets("counter packets 42 bytes 3528 comment test"))
 
+    def test_client_observation_matches_each_assignment_mode(self):
+        address = "fd42:6970:7636:1::1234"
+        stateless = {
+            "client_state": "observed",
+            "client_observed": True,
+            "client_address": address.upper(),
+            "client_method": "slaac",
+            "client_neighbor_state": "STALE",
+            "dhcpv6_bound": False,
+        }
+        stateful = dict(stateless)
+        stateful.update({"client_method": "dhcpv6", "dhcpv6_bound": True})
+        self.assertTrue(LAB.client_observation_matches(stateless, "stateless", address))
+        self.assertTrue(LAB.client_observation_matches(stateful, "stateful", address))
+
+    def test_client_observation_rejects_unusable_or_unbound_evidence(self):
+        status = {
+            "client_state": "observed",
+            "client_observed": True,
+            "client_address": "fd42:6970:7636:2::2b2",
+            "client_method": "dhcpv6",
+            "client_neighbor_state": "FAILED",
+            "dhcpv6_bound": True,
+        }
+        self.assertFalse(
+            LAB.client_observation_matches(status, "stateful", "fd42:6970:7636:2::2b2")
+        )
+        status["client_neighbor_state"] = "REACHABLE"
+        status["dhcpv6_bound"] = False
+        self.assertFalse(
+            LAB.client_observation_matches(status, "stateful", "fd42:6970:7636:2::2b2")
+        )
+
     def test_firewall_placement_uses_real_record_id_only(self):
         self.assertIsNone(LAB.place_before_first([]))
         self.assertEqual("*A", LAB.place_before_first([{".id": "*A"}]))

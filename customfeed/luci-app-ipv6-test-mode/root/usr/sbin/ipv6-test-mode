@@ -2,6 +2,8 @@
 
 # shellcheck source=/dev/null
 . /usr/share/libubox/jshn.sh
+# shellcheck source=/dev/null
+. /lib/functions/network.sh
 
 APP_CONFIG="ipv6test"
 APP_SECTION="main"
@@ -198,6 +200,123 @@ service_running() {
 	/etc/init.d/"$1" running >/dev/null 2>&1
 }
 
+bound_dhcpv6_addresses() {
+	local lease_json="$1"
+	local lease_device="$2"
+	local lease_keys lease_key lease_flags address_keys address_key lease_address
+	jshn -r "$lease_json" >/dev/null 2>&1 || return 1
+	json_load "$lease_json" >/dev/null 2>&1 || return 1
+	json_select device >/dev/null 2>&1 || return 0
+	json_select "$lease_device" >/dev/null 2>&1 || return 0
+	json_select leases >/dev/null 2>&1 || return 0
+	json_get_keys lease_keys
+
+	for lease_key in $lease_keys; do
+		json_select "$lease_key" >/dev/null 2>&1 || continue
+		lease_flags=""
+		json_get_values lease_flags flags >/dev/null 2>&1 || lease_flags=""
+		case " $lease_flags " in
+		*" bound "*) ;;
+		*)
+			json_select ..
+			continue
+			;;
+		esac
+
+		if json_select ipv6-addr >/dev/null 2>&1; then
+			json_get_keys address_keys
+			for address_key in $address_keys; do
+				json_select "$address_key" >/dev/null 2>&1 || continue
+				json_get_var lease_address address
+				[ -n "$lease_address" ] && printf '%s\n' "$lease_address"
+				json_select ..
+			done
+			json_select ..
+		fi
+		json_select ..
+	done
+}
+
+usable_neighbor() {
+	local neighbor_output="$1"
+	local required_address="$2"
+	printf '%s\n' "$neighbor_output" | awk -v required="$required_address" '
+		BEGIN { required = tolower(required) }
+		{
+			address = tolower($1)
+			state = $NF
+			if (required != "" && address != required)
+				next
+			if (state ~ /^(REACHABLE|STALE|DELAY|PROBE)$/)
+				print address "|" state
+		}
+	' | LC_ALL=C sort | sed -n '1p'
+}
+
+observe_client() {
+	local client_device client_neighbors client_candidate client_leases client_addresses
+
+	client_state="disabled"
+	client_observed=0
+	client_address=""
+	client_method=""
+	client_neighbor_state=""
+	dhcpv6_bound=0
+	client_error=""
+
+	[ "$enabled" = "1" ] || return 0
+	client_state="waiting"
+	case "$mode" in
+	stateful) client_method="dhcpv6" ;;
+	*) client_method="slaac" ;;
+	esac
+
+	if ! network_get_device client_device lan || [ -z "$client_device" ]; then
+		client_state="error"
+		client_error="Could not resolve the LAN device."
+		return 0
+	fi
+
+	if ! client_neighbors="$(ip -6 neigh show to "$prefix" dev "$client_device" 2>/dev/null)"; then
+		client_state="error"
+		client_error="Could not read the IPv6 neighbor table."
+		return 0
+	fi
+
+	if [ "$mode" = "stateless" ]; then
+		client_candidate="$(usable_neighbor "$client_neighbors" "")"
+		[ -n "$client_candidate" ] || return 0
+		client_address="${client_candidate%%|*}"
+		client_neighbor_state="${client_candidate#*|}"
+		client_observed=1
+		client_state="observed"
+		return 0
+	fi
+
+	if ! client_leases="$(ubus call dhcp ipv6leases 2>/dev/null)"; then
+		client_state="error"
+		client_error="Could not read DHCPv6 leases."
+		return 0
+	fi
+	if ! client_addresses="$(bound_dhcpv6_addresses "$client_leases" "$client_device")"; then
+		client_state="error"
+		client_error="Could not parse DHCPv6 leases."
+		return 0
+	fi
+	client_address="$(printf '%s\n' "$client_addresses" | LC_ALL=C sort | sed -n '1p')"
+	if [ -z "$client_address" ]; then
+		return 0
+	fi
+
+	dhcpv6_bound=1
+	client_state="assigned"
+	client_candidate="$(usable_neighbor "$client_neighbors" "$client_address")"
+	[ -n "$client_candidate" ] || return 0
+	client_neighbor_state="${client_candidate#*|}"
+	client_observed=1
+	client_state="observed"
+}
+
 status_json() {
 	enabled="$(uci -q get "$APP_CONFIG.$APP_SECTION.enabled")"
 	mode="$(uci -q get "$APP_CONFIG.$APP_SECTION.mode")"
@@ -239,6 +358,7 @@ status_json() {
 	stateful) ra_flags="A=0 O=0 M=1" ;;
 	*) ra_flags="A=1 O=1 M=0" ;;
 	esac
+	observe_client
 
 	json_init
 	json_add_boolean ok "$ok"
@@ -256,6 +376,13 @@ status_json() {
 	json_add_boolean dnsmasq_running "$dnsmasq_running"
 	json_add_boolean firewall_running "$firewall_running"
 	json_add_boolean forwarding_blocked "$forwarding_blocked"
+	json_add_string client_state "$client_state"
+	json_add_boolean client_observed "$client_observed"
+	json_add_string client_address "$client_address"
+	json_add_string client_method "$client_method"
+	json_add_string client_neighbor_state "$client_neighbor_state"
+	json_add_boolean dhcpv6_bound "$dhcpv6_bound"
+	json_add_string client_error "$client_error"
 	json_add_string client_action "Reconnect or renew the client after changing modes."
 	json_add_string error "$(read_last_error)"
 	json_dump

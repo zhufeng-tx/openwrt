@@ -1,5 +1,6 @@
 'use strict';
 'require view';
+'require poll';
 'require rpc';
 'require ui';
 
@@ -33,6 +34,13 @@ var DEFAULT_STATUS = {
 	odhcpd_running: false,
 	dnsmasq_running: false,
 	forwarding_blocked: false,
+	client_state: 'disabled',
+	client_observed: false,
+	client_address: '',
+	client_method: '',
+	client_neighbor_state: '',
+	dhcpv6_bound: false,
+	client_error: '',
 	error: ''
 };
 
@@ -43,6 +51,8 @@ return view.extend({
 	statusNode: null,
 	prefixInput: null,
 	reconnectNode: null,
+	pollFn: null,
+	refreshFailed: false,
 
 	load: function() {
 		return L.resolveDefault(callStatus(), DEFAULT_STATUS);
@@ -50,7 +60,13 @@ return view.extend({
 
 	normalizeStatus: function(status) {
 		var data = Object.assign({}, DEFAULT_STATUS, status || {});
+		var clientStates = [ 'disabled', 'waiting', 'assigned', 'observed', 'error' ];
 		data.mode = data.mode === 'stateful' ? 'stateful' : 'stateless';
+		data.client_state = clientStates.indexOf(data.client_state) !== -1 ? data.client_state : 'error';
+		data.client_address = String(data.client_address || '');
+		data.client_method = data.client_method === 'dhcpv6' ? 'dhcpv6' : data.client_method === 'slaac' ? 'slaac' : '';
+		data.client_neighbor_state = String(data.client_neighbor_state || '');
+		data.client_error = String(data.client_error || '');
 		return data;
 	},
 
@@ -66,6 +82,52 @@ return view.extend({
 		]);
 	},
 
+	clientStateLabel: function(state) {
+		switch (state) {
+		case 'observed': return _('IPv6 observed');
+		case 'assigned': return _('Address assigned');
+		case 'waiting': return _('Waiting for client');
+		case 'error': return _('Observation unavailable');
+		default: return _('Observation inactive');
+		}
+	},
+
+	clientEvidence: function(status) {
+		if (status.client_state === 'error')
+			return status.client_error || _('OpenWrt could not read passive client evidence.');
+		if (status.client_state === 'disabled')
+			return _('Enable IPv6 test mode to observe a client on the isolated LAN.');
+		if (status.client_state === 'waiting')
+			return status.client_method === 'dhcpv6'
+				? _('Waiting for a bound DHCPv6 address from the client.')
+				: _('Waiting for the client to use an SLAAC address from this prefix.');
+		if (status.client_state === 'assigned')
+			return _('DHCPv6 assigned this address, but no matching LAN neighbor is visible yet.');
+
+		var assignment = status.client_method === 'dhcpv6' ? _('DHCPv6 bound') : _('SLAAC');
+		var neighbor = status.client_neighbor_state
+			? _('NDP %s').format(status.client_neighbor_state)
+			: _('NDP observed');
+		return _('%s · %s · passive evidence').format(assignment, neighbor);
+	},
+
+	renderClientObservation: function(status) {
+		var address = status.client_address || _('No client address observed');
+		var methodClass = status.client_method ? ' is-' + status.client_method : '';
+		return E('div', { 'class': 'v6lab-client' + methodClass }, [
+			E('div', { 'class': 'v6lab-client-head' }, [
+				E('div', {}, [
+					E('div', { 'class': 'v6lab-eyebrow' }, [ _('Client observation') ]),
+					E('code', { 'class': status.client_address ? '' : 'is-empty' }, [ address ])
+				]),
+				E('span', { 'class': 'v6lab-client-state is-' + status.client_state }, [
+					this.clientStateLabel(status.client_state)
+				])
+			]),
+			E('div', { 'class': 'v6lab-client-evidence' }, [ this.clientEvidence(status) ])
+		]);
+	},
+
 	renderStatus: function() {
 		var status = this.status;
 		var activeLabel = status.enabled
@@ -76,6 +138,11 @@ return view.extend({
 			? E('div', { 'class': 'v6lab-alert is-error' }, [
 				E('strong', {}, [ _('Configuration error') ]),
 				E('span', {}, [ status.error ])
+			])
+			: '';
+		var refreshWarning = this.refreshFailed
+			? E('div', { 'class': 'v6lab-refresh-warning' }, [
+				_('Status refresh unavailable; showing the last result.')
 			])
 			: '';
 
@@ -98,6 +165,8 @@ return view.extend({
 				this.statusChip(_('Local DNS'), status.dnsmasq_running, !status.enabled),
 				this.statusChip(_('Forwarding blocked'), status.forwarding_blocked, !status.enabled)
 			]),
+			this.renderClientObservation(status),
+			refreshWarning,
 			error
 		]);
 	},
@@ -107,6 +176,17 @@ return view.extend({
 		if (this.statusNode && this.statusNode.parentNode)
 			this.statusNode.parentNode.replaceChild(replacement, this.statusNode);
 		this.statusNode = replacement;
+	},
+
+	refreshStatus: function() {
+		return callStatus().then(L.bind(function(result) {
+			this.status = this.normalizeStatus(result);
+			this.refreshFailed = false;
+			this.refreshStatusNode();
+		}, this)).catch(L.bind(function() {
+			this.refreshFailed = true;
+			this.refreshStatusNode();
+		}, this));
 	},
 
 	setMode: function(mode) {
@@ -158,6 +238,7 @@ return view.extend({
 		return callApply(this.selectedMode, prefix).then(L.bind(function(result) {
 			ui.hideModal();
 			this.status = this.normalizeStatus(result);
+			this.refreshFailed = false;
 			this.refreshStatusNode();
 			this.setMode(this.status.mode);
 			if (!this.status.ok) {
@@ -196,6 +277,7 @@ return view.extend({
 		return callDisable().then(L.bind(function(result) {
 			ui.hideModal();
 			this.status = this.normalizeStatus(result);
+			this.refreshFailed = false;
 			this.refreshStatusNode();
 			if (!this.status.ok) {
 				ui.addNotification(null, E('p', {}, [ this.status.error || _('The previous configuration was restored.') ]), 'danger');
@@ -240,15 +322,20 @@ return view.extend({
 			'.v6lab-state.is-active{background:#d9f2ef;color:#006268}.v6lab-state.is-degraded{background:#fff0d1;color:#794600}.v6lab-state.is-disabled{background:#e6eaed;color:#596871}' +
 			'.v6lab-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin:1.15rem 0}.v6lab-facts div{display:flex;flex-direction:column;gap:.25rem}.v6lab-facts span{font-size:.78rem;color:#62727d}.v6lab code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}' +
 			'.v6lab-checks{display:flex;flex-wrap:wrap;gap:.55rem}.v6lab-check{display:flex;align-items:center;gap:.4rem;background:#fff;border:1px solid #d8e1e7;border-radius:7px;padding:.35rem .55rem}.v6lab-dot{width:.55rem;height:.55rem;border-radius:50%;background:#9aa7af}.v6lab-check.is-ok .v6lab-dot{background:#16825d}.v6lab-check.is-bad .v6lab-dot{background:var(--v6-offline)}.v6lab-check.is-off{color:#6c7a83;background:#edf1f3}' +
+			'.v6lab-client{background:#fff;border:1px solid #d8e1e7;border-left:4px solid var(--v6-stateless);border-radius:8px;padding:.85rem 1rem;margin-top:1rem}.v6lab-client.is-dhcpv6{border-left-color:var(--v6-stateful)}.v6lab-client-head{display:flex;align-items:center;justify-content:space-between;gap:1rem}.v6lab-client-head>div{display:flex;flex-direction:column;gap:.2rem}.v6lab-client code.is-empty{color:#73818a}.v6lab-client-state{border-radius:999px;padding:.3rem .65rem;font-size:.8rem;font-weight:700;white-space:nowrap}.v6lab-client-state.is-observed{background:#d9f2ef;color:#006268}.v6lab-client-state.is-assigned,.v6lab-client-state.is-waiting{background:#fff0d1;color:#794600}.v6lab-client-state.is-error{background:#fde8e7;color:#8f1c15}.v6lab-client-state.is-disabled{background:#e6eaed;color:#596871}.v6lab-client-evidence{color:#52636f;font-size:.82rem;margin-top:.5rem}.v6lab-refresh-warning{color:#794600;font-size:.8rem;margin-top:.65rem}' +
 			'.v6lab-modes{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;margin:1rem 0}.v6lab-mode{display:grid;grid-template-columns:1fr auto;gap:.45rem .75rem;text-align:left;border:2px solid #cbd6dc;border-radius:9px;background:#fff;padding:1rem;cursor:pointer;color:inherit}.v6lab-mode:hover{border-color:#8698a3}.v6lab-mode:focus-visible{outline:3px solid var(--v6-focus);outline-offset:2px}.v6lab-mode.is-stateless.is-selected{border-color:var(--v6-stateless);box-shadow:0 0 0 1px var(--v6-stateless)}.v6lab-mode.is-stateful.is-selected{border-color:var(--v6-stateful);box-shadow:0 0 0 1px var(--v6-stateful)}' +
 			'.v6lab-mode-title{font-size:1.08rem;font-weight:750}.v6lab-flags{justify-self:end}.v6lab-mode small{grid-column:1/-1;color:#5d6c75}.v6lab-flow{justify-content:center;background:#fff;border:1px dashed #9fb0ba;border-radius:8px;padding:.75rem;margin:1rem 0;font-weight:700}.v6lab-arrow{color:var(--v6-focus);letter-spacing:.15em}' +
 			'.v6lab-field{display:grid;grid-template-columns:minmax(8rem,12rem) minmax(16rem,1fr);align-items:center;gap:1rem;margin:1rem 0}.v6lab-field label{font-weight:700}.v6lab-prefix{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.v6lab-help{grid-column:2;color:#5d6c75;font-size:.82rem}' +
 			'.v6lab-actions{margin-top:1rem}.v6lab-alert{display:flex;gap:.6rem;align-items:flex-start;border-radius:7px;padding:.8rem 1rem;margin-top:1rem}.v6lab-alert strong{white-space:nowrap}.v6lab-alert.is-error{background:#fde8e7;color:#8f1c15}.v6lab-alert.is-action{background:#e4f0fa;color:#164f75}' +
-			'@media(max-width:700px){.v6lab-facts,.v6lab-modes{grid-template-columns:1fr}.v6lab-status-head,.v6lab-actions{align-items:flex-start;flex-direction:column}.v6lab-field{grid-template-columns:1fr}.v6lab-help{grid-column:1}.v6lab-flow{font-size:.84rem;gap:.45rem}}' +
+			'@media(max-width:700px){.v6lab-facts,.v6lab-modes{grid-template-columns:1fr}.v6lab-status-head,.v6lab-actions,.v6lab-client-head{align-items:flex-start;flex-direction:column}.v6lab-field{grid-template-columns:1fr}.v6lab-help{grid-column:1}.v6lab-flow{font-size:.84rem;gap:.45rem}}' +
 			'@media(prefers-reduced-motion:reduce){.v6lab *{scroll-behavior:auto!important;transition:none!important}}'
 		]);
 
 		this.statusNode = this.renderStatus();
+		if (!this.pollFn) {
+			this.pollFn = L.bind(this.refreshStatus, this);
+			poll.add(this.pollFn, 5);
+		}
 		var statelessCard = this.modeCard(
 			'stateless', _('Stateless'), 'A=1  O=1  M=0',
 			_('The client creates its address with SLAAC.'),

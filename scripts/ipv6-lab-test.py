@@ -45,6 +45,7 @@ PROMPT_RE = re.compile(rb"root@[^:\r\n]+:[^\r\n]*# ")
 BOOT_READY_RE = re.compile(
     rb"(?:root@[^:\r\n]+:[^\r\n]*# |Please press Enter to activate this console\.)"
 )
+USABLE_NEIGHBOR_STATES = ("REACHABLE", "STALE", "DELAY", "PROBE")
 
 
 class LabError(RuntimeError):
@@ -118,6 +119,18 @@ def parse_firewall_packets(text):
     if not match:
         raise LabError(f"firewall rule counter not found: {text.strip()}")
     return int(match.group(1))
+
+
+def client_observation_matches(status, mode, address):
+    expected_method = "dhcpv6" if mode == "stateful" else "slaac"
+    return (
+        status.get("client_state") == "observed"
+        and status.get("client_observed") is True
+        and str(status.get("client_address", "")).lower() == address.lower()
+        and status.get("client_method") == expected_method
+        and status.get("client_neighbor_state") in USABLE_NEIGHBOR_STATES
+        and status.get("dhcpv6_bound") == (mode == "stateful")
+    )
 
 
 def ra_matches(text, mode):
@@ -885,6 +898,17 @@ class IPv6Lab:
             router_address,
         ):
             failures.append(f"{mode} local DNS resolution")
+
+        client_address = str(address.get("address", "")).split("/", 1)[0]
+
+        def observed_client():
+            observation = self.board_rpc("get_status")
+            return observation if client_observation_matches(
+                observation, mode, client_address
+            ) else None
+
+        observation = self.wait_for(f"{mode} OpenWrt client observation", observed_client)
+        self.log.assertion(f"{mode} OpenWrt client observation", True, observation)
         return failures
 
     def run_scenarios(self):
@@ -943,7 +967,10 @@ class IPv6Lab:
         self.log.assertion(
             "disable mode",
             disabled.get("ok") is True and disabled.get("enabled") is False
-            and disabled.get("active_mode") == "disabled",
+            and disabled.get("active_mode") == "disabled"
+            and disabled.get("client_state") == "disabled"
+            and disabled.get("client_observed") is False
+            and disabled.get("dhcpv6_bound") is False,
             disabled,
         )
         self.log.assertion("disabled router address unreachable", not self.router_ping("fd42:6970:7636:2::1"))
