@@ -1,8 +1,9 @@
 # IPv6 test mode TODO
 
-## `/80` downstream support with NDP proxying
+## Investigate /80 downstream support with NDP proxying
 
-Status: implemented and validated on the MT7628/RouterOS lab on 2026-08-25.
+Status: investigation only; the proposed design is not yet approved for
+implementation.
 
 ### Background
 
@@ -60,41 +61,28 @@ Expected packet flow:
         -> the main router sends the packet to Device A
         -> Device A routes it through the downstream interface
 
-### Implemented design
+### Current implementation gaps
 
-- The existing stateless and stateful `/64` modes remain unchanged.
-- LuCI and RPC expose a separate experimental `ndp_proxy` mode with an
-  upstream `/64` and a contained downstream `/80`.
-- Device A uses `eth0.10` upstream and `eth0.20` downstream. `ndppd` listens on
-  VLAN 10 and proxies the `/80` toward VLAN 20.
-- `odhcpd` sends RA/default-router information with SLAAC disabled. A dedicated
-  `dnsmasq-dhcpv6` process assigns IA_NA addresses from an explicit `/80` pool.
-- IPv6 forwarding is allowed only between the two isolated test zones; legacy
-  modes retain their forwarding REJECT rule.
-- RouterOS uses VLAN 10 in `main`, VLAN 20 in an isolated VRF, and VLAN 30 for
-  temporary LuCI management. A scheduler guard protects the control bridge.
-- Apply, disable, boot, service failure, and harness failure paths restore the
-  owned configuration and service state.
+- Prefix validation accepts only ULA /64 prefixes.
+- Address derivation and status checks assume a literal /64.
+- The test topology currently has only the isolated br-lan test interface; it
+  does not model separate upstream and downstream routed interfaces.
+- The test mode deliberately installs an IPv6 forwarding REJECT rule.
+- The IPv6 test image profile includes ndppd, but the test mode has no ndppd
+  service configuration or lifecycle integration.
 
-### Validation
+### Questions to resolve before implementation
 
-The full live run passed 43 assertions. Evidence is in
-`/private/tmp/ipv6-lab-ndppd-live-final`. The final flashed image then passed a
-22-assertion focused proxy/cleanup run in `/private/tmp/ipv6-lab-ndppd-final2`.
-The installed LuCI view asset was also verified through VLAN 30 in
-`/private/tmp/ipv6-lab-ndppd-final-ui`. Together they include:
-
-- `/80` IA_NA assignment and a lab-VRF default route.
-- RA flags `M=1 A=0` with an on-link `/80` and no SLAAC.
-- Neighbor Solicitation/Advertisement plus bidirectional ICMPv6 on both MT7628
-  VLAN interfaces.
-- Forwarding counter growth, LuCI reachability, invalid-prefix rollback, and a
-  negative test where stopping `ndppd` breaks reachability.
-- Final board-disabled state and restoration of RouterOS bridge/VLAN/VRF state.
-
-Proof boundary: the downstream client is a RouterOS VRF on the same physical
-router, not an external host. Packet captures on both board VLANs are therefore
-required to reject local-delivery bypass.
+1. Is NDP proxying required because the upstream router supplies only one /64,
+   or can it delegate/route a separate downstream /64?
+2. Which concrete interface faces the upstream router, and which interface
+   contains the downstream clients?
+3. How should downstream clients receive addresses: static configuration or
+   stateful DHCPv6?
+4. Must existing /64-only test modes remain unchanged while NDP proxying is
+   added as a separate mode?
+5. What RouterOS/OpenWrt packet captures and connectivity checks will be used
+   as acceptance evidence?
 
 ### References
 

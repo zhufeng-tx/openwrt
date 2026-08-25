@@ -12,7 +12,7 @@ var callStatus = rpc.declare({
 var callApply = rpc.declare({
 	object: 'luci.ipv6_test',
 	method: 'apply',
-	params: [ 'mode', 'prefix', 'downstream_prefix' ]
+	params: [ 'mode', 'prefix' ]
 });
 
 var callDisable = rpc.declare({
@@ -26,21 +26,11 @@ var DEFAULT_STATUS = {
 	mode: 'stateless',
 	active_mode: 'degraded',
 	prefix: 'fd42:6970:7636:1::/64',
-	downstream_prefix: 'fd42:6970:7636:1:a69::/80',
-	topology: 'single_lan',
 	router_address: 'fd42:6970:7636:1::1',
-	upstream_device: 'eth0.10',
-	downstream_device: 'eth0.20',
 	dns_address: 'fd42:6970:7636:1::1',
 	dns_name: 'router.ipv6.test',
 	ra_flags: 'A=1 O=1 M=0',
 	address_active: false,
-	upstream_address_active: false,
-	downstream_address_active: false,
-	route_active: false,
-	ndppd_running: false,
-	dhcpv6_server_running: false,
-	forwarding_allowed: false,
 	odhcpd_running: false,
 	dnsmasq_running: false,
 	forwarding_blocked: false,
@@ -60,9 +50,6 @@ return view.extend({
 	modeButtons: null,
 	statusNode: null,
 	prefixInput: null,
-	downstreamInput: null,
-	proxyFields: null,
-	legacyFlow: null,
 	reconnectNode: null,
 	pollFn: null,
 	refreshFailed: false,
@@ -74,8 +61,7 @@ return view.extend({
 	normalizeStatus: function(status) {
 		var data = Object.assign({}, DEFAULT_STATUS, status || {});
 		var clientStates = [ 'disabled', 'waiting', 'assigned', 'observed', 'error' ];
-		data.mode = [ 'stateless', 'stateful', 'ndp_proxy' ].indexOf(data.mode) !== -1 ? data.mode : 'stateless';
-		data.downstream_prefix = String(data.downstream_prefix || DEFAULT_STATUS.downstream_prefix);
+		data.mode = data.mode === 'stateful' ? 'stateful' : 'stateless';
 		data.client_state = clientStates.indexOf(data.client_state) !== -1 ? data.client_state : 'error';
 		data.client_address = String(data.client_address || '');
 		data.client_method = data.client_method === 'dhcpv6' ? 'dhcpv6' : data.client_method === 'slaac' ? 'slaac' : '';
@@ -87,13 +73,6 @@ return view.extend({
 	validatePrefix: function(value) {
 		var normalized = String(value || '').trim().toLowerCase();
 		return /^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){3}::\/64$/.test(normalized) ? normalized : null;
-	},
-
-	validateDownstreamPrefix: function(upstream, value) {
-		var normalized = String(value || '').trim().toLowerCase();
-		var downstream = /^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){4}::\/80$/.test(normalized) ? normalized : null;
-		var upstreamBase = upstream ? upstream.replace(/::\/64$/, '') : '';
-		return downstream && downstream.indexOf(upstreamBase + ':') === 0 ? downstream : null;
 	},
 
 	statusChip: function(label, active, neutral) {
@@ -151,9 +130,8 @@ return view.extend({
 
 	renderStatus: function() {
 		var status = this.status;
-		var proxy = status.mode === 'ndp_proxy';
 		var activeLabel = status.enabled
-			? (status.active_mode === 'degraded' ? _('Degraded') : proxy ? _('NDP Proxy') : status.mode === 'stateful' ? _('Stateful') : _('Stateless'))
+			? (status.active_mode === 'degraded' ? _('Degraded') : status.mode === 'stateful' ? _('Stateful') : _('Stateless'))
 			: _('Disabled');
 		var tone = !status.enabled ? 'is-disabled' : status.ok ? 'is-active' : 'is-degraded';
 		var error = status.error
@@ -168,31 +146,7 @@ return view.extend({
 			])
 			: '';
 
-		var facts = proxy ? [
-			E('div', {}, [ E('span', {}, [ _('Upstream /64') ]), E('code', {}, [ status.prefix ]) ]),
-			E('div', {}, [ E('span', {}, [ _('Downstream /80') ]), E('code', {}, [ status.downstream_prefix ]) ]),
-			E('div', {}, [ E('span', {}, [ _('Downstream router') ]), E('code', {}, [ status.router_address ]) ])
-		] : [
-			E('div', {}, [ E('span', {}, [ _('Prefix') ]), E('code', {}, [ status.prefix ]) ]),
-			E('div', {}, [ E('span', {}, [ _('Router and DNS') ]), E('code', {}, [ status.router_address ]) ]),
-			E('div', {}, [ E('span', {}, [ _('Local DNS name') ]), E('code', {}, [ status.dns_name ]) ])
-		];
-		var checks = proxy ? [
-			this.statusChip(_('VLAN 10 upstream'), status.upstream_address_active, !status.enabled),
-			this.statusChip(_('VLAN 20 downstream'), status.downstream_address_active, !status.enabled),
-			this.statusChip(_('Downstream route'), status.route_active, !status.enabled),
-			this.statusChip(_('ndppd'), status.ndppd_running, !status.enabled),
-			this.statusChip(_('DHCPv6 pool'), status.dhcpv6_server_running, !status.enabled),
-			this.statusChip(_('Forwarding allowed'), status.forwarding_allowed, !status.enabled),
-			this.statusChip(_('odhcpd'), status.odhcpd_running, !status.enabled)
-		] : [
-			this.statusChip(_('LAN address'), status.address_active, !status.enabled),
-			this.statusChip(_('odhcpd'), status.odhcpd_running, !status.enabled),
-			this.statusChip(_('Local DNS'), status.dnsmasq_running, !status.enabled),
-			this.statusChip(_('Forwarding blocked'), status.forwarding_blocked, !status.enabled)
-		];
-
-		return E('div', { 'class': 'v6lab-status' + (proxy ? ' is-proxy' : '') }, [
+		return E('div', { 'class': 'v6lab-status' }, [
 			E('div', { 'class': 'v6lab-status-head' }, [
 				E('div', {}, [
 					E('div', { 'class': 'v6lab-eyebrow' }, [ _('IPv6 test environment') ]),
@@ -200,8 +154,17 @@ return view.extend({
 				]),
 				E('span', { 'class': 'v6lab-state ' + tone }, [ activeLabel ])
 			]),
-			E('div', { 'class': 'v6lab-facts' }, facts),
-			E('div', { 'class': 'v6lab-checks' }, checks),
+			E('div', { 'class': 'v6lab-facts' }, [
+				E('div', {}, [ E('span', {}, [ _('Prefix') ]), E('code', {}, [ status.prefix ]) ]),
+				E('div', {}, [ E('span', {}, [ _('Router and DNS') ]), E('code', {}, [ status.router_address ]) ]),
+				E('div', {}, [ E('span', {}, [ _('Local DNS name') ]), E('code', {}, [ status.dns_name ]) ])
+			]),
+			E('div', { 'class': 'v6lab-checks' }, [
+				this.statusChip(_('LAN address'), status.address_active, !status.enabled),
+				this.statusChip(_('odhcpd'), status.odhcpd_running, !status.enabled),
+				this.statusChip(_('Local DNS'), status.dnsmasq_running, !status.enabled),
+				this.statusChip(_('Forwarding blocked'), status.forwarding_blocked, !status.enabled)
+			]),
 			this.renderClientObservation(status),
 			refreshWarning,
 			error
@@ -227,16 +190,12 @@ return view.extend({
 	},
 
 	setMode: function(mode) {
-		this.selectedMode = [ 'stateless', 'stateful', 'ndp_proxy' ].indexOf(mode) !== -1 ? mode : 'stateless';
+		this.selectedMode = mode === 'stateful' ? 'stateful' : 'stateless';
 		Object.keys(this.modeButtons || {}).forEach(L.bind(function(key) {
 			var selected = key === this.selectedMode;
 			this.modeButtons[key].classList.toggle('is-selected', selected);
 			this.modeButtons[key].setAttribute('aria-pressed', selected ? 'true' : 'false');
 		}, this));
-		if (this.proxyFields)
-			this.proxyFields.style.display = this.selectedMode === 'ndp_proxy' ? '' : 'none';
-		if (this.legacyFlow)
-			this.legacyFlow.style.display = this.selectedMode === 'ndp_proxy' ? 'none' : '';
 	},
 
 	modeCard: function(mode, title, flags, addressText, dnsText) {
@@ -264,7 +223,6 @@ return view.extend({
 
 	handleApply: function() {
 		var prefix = this.validatePrefix(this.prefixInput.value);
-		var downstream = this.validateDownstreamPrefix(prefix, this.downstreamInput.value);
 		if (!prefix) {
 			this.prefixInput.setCustomValidity(_('Use normalized ULA /64 form: fdxx:xxxx:xxxx:xxxx::/64'));
 			this.prefixInput.reportValidity();
@@ -272,20 +230,12 @@ return view.extend({
 		}
 		this.prefixInput.setCustomValidity('');
 		this.prefixInput.value = prefix;
-		if (this.selectedMode === 'ndp_proxy' && !downstream) {
-			this.downstreamInput.setCustomValidity(_('Use a normalized ULA /80 contained by the upstream /64.'));
-			this.downstreamInput.reportValidity();
-			return;
-		}
-		this.downstreamInput.setCustomValidity('');
-		if (downstream)
-			this.downstreamInput.value = downstream;
 
 		ui.showModal(_('Applying IPv6 test mode'), [
 			E('p', { 'class': 'spinning' }, [ _('Reloading the LAN and IPv6 services…') ])
 		]);
 
-		return callApply(this.selectedMode, prefix, downstream || this.downstreamInput.value).then(L.bind(function(result) {
+		return callApply(this.selectedMode, prefix).then(L.bind(function(result) {
 			ui.hideModal();
 			this.status = this.normalizeStatus(result);
 			this.refreshFailed = false;
@@ -353,36 +303,6 @@ return view.extend({
 			'spellcheck': 'false',
 			'input': function() { this.setCustomValidity(''); }
 		});
-		this.downstreamInput = E('input', {
-			'id': 'v6lab-downstream-prefix',
-			'type': 'text',
-			'class': 'cbi-input-text v6lab-prefix',
-			'value': this.status.downstream_prefix,
-			'placeholder': 'fd42:6970:7636:1:a69::/80',
-			'spellcheck': 'false',
-			'input': function() { this.setCustomValidity(''); }
-		});
-		this.legacyFlow = E('div', { 'class': 'v6lab-flow', 'aria-label': _('Router Advertisement flow') }, [
-			E('span', {}, [ _('Router') ]),
-			E('span', { 'class': 'v6lab-arrow', 'aria-hidden': 'true' }, [ '── RA + DHCPv6 ──▶' ]),
-			E('span', {}, [ _('Test client') ])
-		]);
-		this.proxyFields = E('div', { 'class': 'v6lab-proxy-fields' }, [
-			E('div', { 'class': 'v6lab-topology', 'aria-label': _('NDP proxy VLAN topology') }, [
-				E('span', { 'class': 'v6lab-vlan' }, [ _('VLAN 10 upstream') ]),
-				E('span', { 'class': 'v6lab-proxy-hop', 'aria-hidden': 'true' }, [ '── NDP proxy ──▶' ]),
-				E('span', { 'class': 'v6lab-vlan' }, [ _('VLAN 20 downstream') ])
-			]),
-			E('div', { 'class': 'v6lab-field' }, [
-				E('label', { 'for': 'v6lab-downstream-prefix' }, [ _('Downstream ULA /80') ]),
-				this.downstreamInput,
-				E('div', { 'class': 'v6lab-help' }, [ _('Stateful DHCPv6 assigns client addresses. ndppd answers upstream neighbor discovery for this contained /80.') ])
-			]),
-			E('div', { 'class': 'v6lab-alert is-experimental' }, [
-				E('strong', {}, [ _('Experimental routed mode') ]),
-				E('span', {}, [ _('Requires RouterOS VLAN 10 upstream and VLAN 20 downstream. IPv4 LuCI management remains on the untagged LAN.') ])
-			])
-		]);
 
 		this.reconnectNode = E('div', {
 			'class': 'v6lab-alert is-action',
@@ -395,19 +315,19 @@ return view.extend({
 		]);
 
 		var style = E('style', { 'type': 'text/css' }, [
-			':root{--v6-ink:#1d2a33;--v6-panel:#f4f7f9;--v6-stateless:#007f86;--v6-stateful:#9a5b00;--v6-proxy:#5b4ab8;--v6-offline:#b42318;--v6-focus:#1261a0}' +
+			':root{--v6-ink:#1d2a33;--v6-panel:#f4f7f9;--v6-stateless:#007f86;--v6-stateful:#9a5b00;--v6-offline:#b42318;--v6-focus:#1261a0}' +
 			'.v6lab{color:var(--v6-ink);max-width:1080px}.v6lab-status,.v6lab-panel{background:var(--v6-panel);border:1px solid #d8e1e7;border-radius:10px;padding:1.25rem;margin-bottom:1rem}' +
-			'.v6lab-status{border-top:4px solid var(--v6-offline)}.v6lab-status.is-proxy{border-top-color:var(--v6-proxy)}.v6lab-status-head,.v6lab-actions,.v6lab-flow{display:flex;align-items:center;justify-content:space-between;gap:1rem}' +
+			'.v6lab-status{border-top:4px solid var(--v6-offline)}.v6lab-status-head,.v6lab-actions,.v6lab-flow{display:flex;align-items:center;justify-content:space-between;gap:1rem}' +
 			'.v6lab-eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:.72rem;font-weight:700;color:#52636f}.v6lab h2{margin:.2rem 0 0}.v6lab-state{border-radius:999px;padding:.35rem .75rem;font-weight:700}' +
 			'.v6lab-state.is-active{background:#d9f2ef;color:#006268}.v6lab-state.is-degraded{background:#fff0d1;color:#794600}.v6lab-state.is-disabled{background:#e6eaed;color:#596871}' +
 			'.v6lab-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin:1.15rem 0}.v6lab-facts div{display:flex;flex-direction:column;gap:.25rem}.v6lab-facts span{font-size:.78rem;color:#62727d}.v6lab code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}' +
 			'.v6lab-checks{display:flex;flex-wrap:wrap;gap:.55rem}.v6lab-check{display:flex;align-items:center;gap:.4rem;background:#fff;border:1px solid #d8e1e7;border-radius:7px;padding:.35rem .55rem}.v6lab-dot{width:.55rem;height:.55rem;border-radius:50%;background:#9aa7af}.v6lab-check.is-ok .v6lab-dot{background:#16825d}.v6lab-check.is-bad .v6lab-dot{background:var(--v6-offline)}.v6lab-check.is-off{color:#6c7a83;background:#edf1f3}' +
 			'.v6lab-client{background:#fff;border:1px solid #d8e1e7;border-left:4px solid var(--v6-stateless);border-radius:8px;padding:.85rem 1rem;margin-top:1rem}.v6lab-client.is-dhcpv6{border-left-color:var(--v6-stateful)}.v6lab-client-head{display:flex;align-items:center;justify-content:space-between;gap:1rem}.v6lab-client-head>div{display:flex;flex-direction:column;gap:.2rem}.v6lab-client code.is-empty{color:#73818a}.v6lab-client-state{border-radius:999px;padding:.3rem .65rem;font-size:.8rem;font-weight:700;white-space:nowrap}.v6lab-client-state.is-observed{background:#d9f2ef;color:#006268}.v6lab-client-state.is-assigned,.v6lab-client-state.is-waiting{background:#fff0d1;color:#794600}.v6lab-client-state.is-error{background:#fde8e7;color:#8f1c15}.v6lab-client-state.is-disabled{background:#e6eaed;color:#596871}.v6lab-client-evidence{color:#52636f;font-size:.82rem;margin-top:.5rem}.v6lab-refresh-warning{color:#794600;font-size:.8rem;margin-top:.65rem}' +
-			'.v6lab-modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.85rem;margin:1rem 0}.v6lab-mode{display:grid;grid-template-columns:1fr auto;gap:.45rem .75rem;text-align:left;border:2px solid #cbd6dc;border-radius:9px;background:#fff;padding:1rem;cursor:pointer;color:inherit}.v6lab-mode:hover{border-color:#8698a3}.v6lab-mode:focus-visible{outline:3px solid var(--v6-focus);outline-offset:2px}.v6lab-mode.is-stateless.is-selected{border-color:var(--v6-stateless);box-shadow:0 0 0 1px var(--v6-stateless)}.v6lab-mode.is-stateful.is-selected{border-color:var(--v6-stateful);box-shadow:0 0 0 1px var(--v6-stateful)}.v6lab-mode.is-ndp_proxy.is-selected{border-color:var(--v6-proxy);box-shadow:0 0 0 1px var(--v6-proxy)}' +
+			'.v6lab-modes{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;margin:1rem 0}.v6lab-mode{display:grid;grid-template-columns:1fr auto;gap:.45rem .75rem;text-align:left;border:2px solid #cbd6dc;border-radius:9px;background:#fff;padding:1rem;cursor:pointer;color:inherit}.v6lab-mode:hover{border-color:#8698a3}.v6lab-mode:focus-visible{outline:3px solid var(--v6-focus);outline-offset:2px}.v6lab-mode.is-stateless.is-selected{border-color:var(--v6-stateless);box-shadow:0 0 0 1px var(--v6-stateless)}.v6lab-mode.is-stateful.is-selected{border-color:var(--v6-stateful);box-shadow:0 0 0 1px var(--v6-stateful)}' +
 			'.v6lab-mode-title{font-size:1.08rem;font-weight:750}.v6lab-flags{justify-self:end}.v6lab-mode small{grid-column:1/-1;color:#5d6c75}.v6lab-flow{justify-content:center;background:#fff;border:1px dashed #9fb0ba;border-radius:8px;padding:.75rem;margin:1rem 0;font-weight:700}.v6lab-arrow{color:var(--v6-focus);letter-spacing:.15em}' +
-			'.v6lab-field{display:grid;grid-template-columns:minmax(8rem,12rem) minmax(16rem,1fr);align-items:center;gap:1rem;margin:1rem 0}.v6lab-field label{font-weight:700}.v6lab-prefix{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.v6lab-help{grid-column:2;color:#5d6c75;font-size:.82rem}.v6lab-topology{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:.75rem;background:#f0eefc;border:1px solid #cfc8f2;border-radius:9px;padding:.85rem 1rem;margin:1rem 0;color:#342977;font-weight:750}.v6lab-vlan{text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.v6lab-proxy-hop{color:var(--v6-proxy);white-space:nowrap}' +
-			'.v6lab-actions{margin-top:1rem}.v6lab-alert{display:flex;gap:.6rem;align-items:flex-start;border-radius:7px;padding:.8rem 1rem;margin-top:1rem}.v6lab-alert strong{white-space:nowrap}.v6lab-alert.is-error{background:#fde8e7;color:#8f1c15}.v6lab-alert.is-action{background:#e4f0fa;color:#164f75}.v6lab-alert.is-experimental{background:#f0eefc;color:#342977}' +
-			'@media(max-width:700px){.v6lab-facts,.v6lab-modes,.v6lab-topology{grid-template-columns:1fr}.v6lab-status-head,.v6lab-actions,.v6lab-client-head{align-items:flex-start;flex-direction:column}.v6lab-field{grid-template-columns:1fr}.v6lab-help{grid-column:1}.v6lab-flow{font-size:.84rem;gap:.45rem}.v6lab-proxy-hop{white-space:normal;text-align:center}}' +
+			'.v6lab-field{display:grid;grid-template-columns:minmax(8rem,12rem) minmax(16rem,1fr);align-items:center;gap:1rem;margin:1rem 0}.v6lab-field label{font-weight:700}.v6lab-prefix{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.v6lab-help{grid-column:2;color:#5d6c75;font-size:.82rem}' +
+			'.v6lab-actions{margin-top:1rem}.v6lab-alert{display:flex;gap:.6rem;align-items:flex-start;border-radius:7px;padding:.8rem 1rem;margin-top:1rem}.v6lab-alert strong{white-space:nowrap}.v6lab-alert.is-error{background:#fde8e7;color:#8f1c15}.v6lab-alert.is-action{background:#e4f0fa;color:#164f75}' +
+			'@media(max-width:700px){.v6lab-facts,.v6lab-modes{grid-template-columns:1fr}.v6lab-status-head,.v6lab-actions,.v6lab-client-head{align-items:flex-start;flex-direction:column}.v6lab-field{grid-template-columns:1fr}.v6lab-help{grid-column:1}.v6lab-flow{font-size:.84rem;gap:.45rem}}' +
 			'@media(prefers-reduced-motion:reduce){.v6lab *{scroll-behavior:auto!important;transition:none!important}}'
 		]);
 
@@ -426,26 +346,24 @@ return view.extend({
 			_('The DHCPv6 server assigns the client address.'),
 			_('The same DHCPv6 exchange supplies local DNS.')
 		);
-		var proxyCard = this.modeCard(
-			'ndp_proxy', _('NDP Proxy /80'), 'V10  ⇄  V20',
-			_('DHCPv6 assigns addresses from a routed /80.'),
-			_('ndppd answers upstream discovery; SLAAC stays off.')
-		);
 
 		var page = E('div', { 'class': 'v6lab' }, [
 			style,
 			this.statusNode,
 			E('section', { 'class': 'v6lab-panel' }, [
 				E('h3', {}, [ _('Address assignment mode') ]),
-				E('p', {}, [ _('Use the single-LAN modes for isolated /64 tests, or the routed proxy mode for a stateful downstream /80.') ]),
-				E('div', { 'class': 'v6lab-modes' }, [ statelessCard, statefulCard, proxyCard ]),
-				this.legacyFlow,
-				E('div', { 'class': 'v6lab-field' }, [
-					E('label', { 'for': 'v6lab-prefix' }, [ _('Test or upstream ULA /64') ]),
-					this.prefixInput,
-					E('div', { 'class': 'v6lab-help' }, [ _('Use normalized ULA form. Proxy mode gives Device A host address ::a69 on this upstream link.') ])
+				E('p', {}, [ _('Router Advertisements always provide the test prefix and default gateway. Internet forwarding remains blocked in both modes.') ]),
+				E('div', { 'class': 'v6lab-modes' }, [ statelessCard, statefulCard ]),
+				E('div', { 'class': 'v6lab-flow', 'aria-label': _('Router Advertisement flow') }, [
+					E('span', {}, [ _('Router') ]),
+					E('span', { 'class': 'v6lab-arrow', 'aria-hidden': 'true' }, [ '── RA + DHCPv6 ──▶' ]),
+					E('span', {}, [ _('Test client') ])
 				]),
-				this.proxyFields,
+				E('div', { 'class': 'v6lab-field' }, [
+					E('label', { 'for': 'v6lab-prefix' }, [ _('Test ULA prefix') ]),
+					this.prefixInput,
+					E('div', { 'class': 'v6lab-help' }, [ _('Use a locally assigned ULA with a /64 prefix. The router and DNS server use host address ::1.') ])
+				]),
 				E('div', { 'class': 'v6lab-actions' }, [
 					E('button', {
 						'class': 'btn cbi-button-negative',

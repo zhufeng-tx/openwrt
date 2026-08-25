@@ -48,7 +48,6 @@ class ParserTests(unittest.TestCase):
         stateful.update({"client_method": "dhcpv6", "dhcpv6_bound": True})
         self.assertTrue(LAB.client_observation_matches(stateless, "stateless", address))
         self.assertTrue(LAB.client_observation_matches(stateful, "stateful", address))
-        self.assertTrue(LAB.client_observation_matches(stateful, "ndp_proxy", address))
 
     def test_client_observation_rejects_unusable_or_unbound_evidence(self):
         status = {
@@ -79,13 +78,6 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(LAB.ra_matches(stateless, "stateful"))
         self.assertTrue(LAB.ra_matches(stateful, "stateful"))
         self.assertFalse(LAB.ra_matches(stateful, "stateless"))
-        self.assertTrue(LAB.ra_matches(stateful, "ndp_proxy"))
-
-    def test_proxy_capture_requires_ndp_and_bidirectional_echo(self):
-        upstream = "neighbor solicitation\nneighbor advertisement\necho request\necho reply"
-        downstream = "echo request\necho reply"
-        self.assertTrue(LAB.proxy_capture_matches(upstream, downstream))
-        self.assertFalse(LAB.proxy_capture_matches("echo request\necho reply", downstream))
 
     def test_serial_frame_uses_emitted_marker_after_echoed_command(self):
         marker = "__IPV6_LAB_1_1"
@@ -231,7 +223,7 @@ class CliSafetyTests(unittest.TestCase):
         args = LAB.parse_args(
             [
                 "run", "--serial", "/dev/cu.test", "--allow-shared-bridge",
-                "--confirm-device-changes", "--final-mode", "stateless",
+                "--confirm-device-changes",
             ]
         )
         with self.assertRaises(LAB.PreflightError):
@@ -247,34 +239,15 @@ class CliSafetyTests(unittest.TestCase):
         self.assertEqual("disabled", args.final_mode)
         LAB.enforce_run_safety(args)
 
-    def test_run_defaults_to_restore_safe_topology(self):
-        args = LAB.parse_args(["run", "--serial", "/dev/cu.test"])
-        self.assertEqual("disabled", args.final_mode)
-        self.assertEqual("ether1", args.router_control_interface)
-        self.assertFalse(args.proxy_only)
-
-    def test_proxy_only_debug_run_parses(self):
-        args = LAB.parse_args(["run", "--serial", "/dev/cu.test", "--proxy-only", "--skip-flash"])
-        self.assertTrue(args.proxy_only)
-        self.assertTrue(args.skip_flash)
-
 
 class FakeRouter:
     def __init__(self):
         self.data = {
             "system/resource": [{"version": "7.18.2"}],
             "interface/ethernet": [{".id": "*e", "name": "ether2", "disabled": "false"}],
-            "interface/bridge": [
-                {".id": "*br", "name": "test", "pvid": "1", "vlan-filtering": "false"}
-            ],
             "interface/bridge/port": [
                 {".id": "*b", "interface": "ether2", "bridge": "test", "disabled": "true"}
             ],
-            "interface/bridge/vlan": [],
-            "interface/vlan": [],
-            "ip/vrf": [{".id": "*0", "name": "main"}],
-            "routing/table": [{".id": "*0", "name": "main"}],
-            "system/scheduler": [],
             "ip/address": [
                 {".id": "*a", "address": "192.168.1.254/24", "comment": LAB.TAG + "-flash"}
             ],
@@ -282,7 +255,6 @@ class FakeRouter:
             "ipv6/address": [],
             "ipv6/route": [],
             "ipv6/dhcp-client": [],
-            "ipv6/neighbor": [],
             "ip/dns": [{}],
             "ip/firewall/filter": [],
             "ip/firewall/nat": [],
@@ -304,8 +276,6 @@ class FakeRouter:
             self.data[path][0].update(values)
         elif path.startswith("interface/bridge/port/"):
             self.data["interface/bridge/port"][0].update(values)
-        elif path.startswith("interface/bridge/"):
-            self.data["interface/bridge"][0].update(values)
         return {}
 
 
@@ -332,7 +302,6 @@ class RestorationTests(unittest.TestCase):
                 router_url="http://127.0.0.1",
                 router_user="admin",
                 router_interface="ether2",
-                router_control_interface="ether1",
             )
             lab = LAB.IPv6Lab(args, "secret")
             fake = FakeRouter()

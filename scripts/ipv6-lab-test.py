@@ -36,14 +36,6 @@ import urllib.request
 TAG = "openwrt-ipv6-lab"
 DEFAULT_PREFIX = "fd42:6970:7636:1::/64"
 STATEFUL_PREFIX = "fd42:6970:7636:2::/64"
-NDP_DOWNSTREAM_PREFIX = "fd42:6970:7636:1:a69::/80"
-NDP_UPSTREAM_ADDRESS = "fd42:6970:7636:1::1/64"
-NDP_CLIENT_PREFIX = "fd42:6970:7636:1:a69:"
-LAB_UPSTREAM = f"{TAG}-up-v10"
-LAB_DOWNSTREAM = f"{TAG}-down-v20"
-LAB_MANAGEMENT = f"{TAG}-mgmt-v30"
-LAB_VRF = f"{TAG}-down"
-LAB_GUARD = f"{TAG}-guard"
 DEFAULT_IMAGE = (
     "bin/targets/ramips/mt76x8/"
     "openwrt-ramips-mt76x8-devboard_wifi-test-board-hiwooya-16m-"
@@ -130,14 +122,14 @@ def parse_firewall_packets(text):
 
 
 def client_observation_matches(status, mode, address):
-    expected_method = "dhcpv6" if mode in ("stateful", "ndp_proxy") else "slaac"
+    expected_method = "dhcpv6" if mode == "stateful" else "slaac"
     return (
         status.get("client_state") == "observed"
         and status.get("client_observed") is True
         and str(status.get("client_address", "")).lower() == address.lower()
         and status.get("client_method") == expected_method
         and status.get("client_neighbor_state") in USABLE_NEIGHBOR_STATES
-        and status.get("dhcpv6_bound") == (mode in ("stateful", "ndp_proxy"))
+        and status.get("dhcpv6_bound") == (mode == "stateful")
     )
 
 
@@ -151,19 +143,6 @@ def ra_matches(text, mode):
     if mode == "stateless":
         return not managed and other and autonomous
     return managed and not other and not autonomous
-
-
-def proxy_capture_matches(upstream, downstream):
-    upstream = upstream.lower()
-    downstream = downstream.lower()
-    return (
-        "neighbor solicitation" in upstream
-        and "neighbor advertisement" in upstream
-        and "echo request" in upstream
-        and "echo request" in downstream
-        and "echo reply" in downstream
-        and "echo reply" in upstream
-    )
 
 
 def parse_serial_frame(raw, marker):
@@ -472,8 +451,6 @@ class IPv6Lab:
         self.snapshot = None
         self.flash_complete = False
         self.router_changed = False
-        self.lab_bridge = None
-        self.board_forwarding_before = None
 
     def write_snapshot(self, snapshot):
         path = self.log.results_dir / "router-before.json"
@@ -483,12 +460,9 @@ class IPv6Lab:
 
     def router_snapshot(self):
         paths = (
-            "system/resource", "interface/ethernet", "interface/bridge",
-            "interface/bridge/port", "interface/bridge/vlan", "interface/vlan",
-            "ip/vrf", "routing/table", "system/scheduler",
+            "system/resource", "interface/ethernet", "interface/bridge/port",
             "ip/address", "ipv6/settings", "ipv6/address", "ipv6/route",
-            "ipv6/dhcp-client", "ipv6/neighbor", "ip/dns",
-            "ip/firewall/filter", "ip/firewall/nat",
+            "ipv6/dhcp-client", "ip/dns", "ip/firewall/filter", "ip/firewall/nat",
         )
         return {path: self.router.get(path) for path in paths}
 
@@ -519,18 +493,6 @@ class IPv6Lab:
 
         bridge_ports = records(self.router.get("interface/bridge/port"))
         own_ports = [item for item in bridge_ports if item.get("interface") == self.args.router_interface]
-        if len(own_ports) != 1:
-            raise PreflightError(f"expected {self.args.router_interface} to be one bridge port")
-        self.lab_bridge = own_ports[0].get("bridge")
-        control_ports = [
-            item for item in bridge_ports
-            if item.get("interface") == self.args.router_control_interface
-            and item.get("bridge") == self.lab_bridge
-        ]
-        if len(control_ports) != 1:
-            raise PreflightError(
-                f"expected control interface {self.args.router_control_interface} on bridge {self.lab_bridge}"
-            )
         for own in own_ports:
             if boolish(own.get("disabled", "false")):
                 continue
@@ -557,10 +519,7 @@ class IPv6Lab:
         if conflicts:
             raise PreflightError("RouterOS has conflicting 192.168.1.0/24 state: " + ", ".join(conflicts))
 
-        for path in (
-            "ipv6/dhcp-client", "ip/firewall/filter", "ip/firewall/nat", "ip/address",
-            "ipv6/address", "interface/vlan", "interface/bridge/vlan", "system/scheduler",
-        ):
+        for path in ("ipv6/dhcp-client", "ip/firewall/filter", "ip/firewall/nat", "ip/address"):
             stale = [
                 item.get("comment") for item in records(self.router.get(path))
                 if str(item.get("comment", "")).startswith(TAG)
@@ -569,11 +528,6 @@ class IPv6Lab:
                 raise PreflightError(
                     f"RouterOS contains stale {TAG} records in {path}; restore or remove them before a new run"
                 )
-        if self.matching("ip/vrf", "name", LAB_VRF):
-            raise PreflightError(f"RouterOS contains stale VRF {LAB_VRF}")
-        for name in (LAB_UPSTREAM, LAB_DOWNSTREAM, LAB_MANAGEMENT):
-            if self.matching("interface/vlan", "name", name):
-                raise PreflightError(f"RouterOS contains stale VLAN interface {name}")
 
         serial_log = self.log.results_dir / "serial.log"
         self.serial = SerialConsole(self.args.serial, self.args.baud, serial_log)
@@ -590,38 +544,18 @@ class IPv6Lab:
         )
         if rc:
             raise PreflightError(f"board lacks required flash tools: {tools_text}")
-        forwarding_text, rc = self.serial.command(
-            "cat /proc/sys/net/ipv6/conf/all/forwarding"
-        )
-        if rc or forwarding_text.strip() not in ("0", "1"):
-            raise PreflightError(f"could not read board IPv6 forwarding state: {forwarding_text}")
-        self.board_forwarding_before = forwarding_text.strip()
         self.log.summary["router"] = {"version": version, "board-name": resource.get("board-name")}
         self.log.summary["board_before"] = board
-        self.log.summary["board_forwarding_before"] = self.board_forwarding_before
         self.log.flush()
         return {"image": str(image), "sha256": digest, "router": resource, "board": board}
 
     def remove_tagged(self):
-        ordered_paths = (
-            "ipv6/dhcp-client", "ipv6/address", "ip/address",
-            "ip/firewall/filter", "ip/firewall/nat", "system/scheduler",
-            "interface/bridge/vlan",
-        )
-        for path in ordered_paths:
+        for path in ("ipv6/dhcp-client", "ip/firewall/filter", "ip/firewall/nat", "ip/address"):
             for item in records(self.router.get(path)):
-                tagged = str(item.get("comment", "")).startswith(TAG)
-                named = item.get("name") in (LAB_UPSTREAM, LAB_DOWNSTREAM, LAB_MANAGEMENT, LAB_GUARD)
-                if tagged or named:
+                if str(item.get("comment", "")).startswith(TAG):
                     item_id = record_id(item)
                     if item_id:
                         self.router.remove(path, item_id)
-        for item in records(self.router.get("ip/vrf")):
-            if item.get("name") == LAB_VRF and record_id(item):
-                self.router.remove("ip/vrf", record_id(item))
-        for item in records(self.router.get("interface/vlan")):
-            if item.get("name") in (LAB_UPSTREAM, LAB_DOWNSTREAM, LAB_MANAGEMENT) and record_id(item):
-                self.router.remove("interface/vlan", record_id(item))
 
     def set_ipv6_setting(self, value):
         try:
@@ -634,46 +568,21 @@ class IPv6Lab:
         if not snapshot:
             return
         errors = []
-        original_ports = records(snapshot.get("interface/bridge/port"))
-        test_ports = [item for item in original_ports if item.get("interface") == self.args.router_interface]
-        bridge_name = test_ports[0].get("bridge") if test_ports else self.lab_bridge
-        if bridge_name:
-            try:
-                current_bridges = self.matching("interface/bridge", "name", bridge_name)
-                if current_bridges and record_id(current_bridges[0]):
-                    bridge_id = urllib.parse.quote(str(record_id(current_bridges[0])), safe="*-")
-                    self.router.set(f"interface/bridge/{bridge_id}", {"vlan-filtering": "false"})
-            except LabError as exc:
-                errors.append(str(exc))
         try:
             self.remove_tagged()
         except LabError as exc:
             errors.append(str(exc))
 
-        before_ports = {record_id(item): item for item in original_ports if record_id(item)}
+        before_ports = {
+            record_id(item): item for item in records(snapshot.get("interface/bridge/port"))
+            if item.get("interface") == self.args.router_interface and record_id(item)
+        }
         for item_id, item in before_ports.items():
             try:
-                values = {
-                    key: item[key] for key in
-                    ("disabled", "pvid", "frame-types", "ingress-filtering")
-                    if key in item
-                }
                 self.router.set(
                     f"interface/bridge/port/{urllib.parse.quote(str(item_id), safe='*-')}",
-                    values,
+                    {"disabled": item.get("disabled", "false")},
                 )
-            except LabError as exc:
-                errors.append(str(exc))
-
-        for item in records(snapshot.get("interface/bridge")):
-            if item.get("name") != bridge_name or not record_id(item):
-                continue
-            try:
-                values = {
-                    key: item[key] for key in ("pvid", "vlan-filtering") if key in item
-                }
-                bridge_id = urllib.parse.quote(str(record_id(item)), safe="*-")
-                self.router.set(f"interface/bridge/{bridge_id}", values)
             except LabError as exc:
                 errors.append(str(exc))
 
@@ -714,183 +623,6 @@ class IPv6Lab:
                         self.router.remove("ipv6/dhcp-client", record_id(item))
         if failures:
             raise PreflightError("RouterOS-only DHCPv6 capability check failed: " + "; ".join(failures))
-
-    def bridge_record(self):
-        matches = self.matching("interface/bridge", "name", self.lab_bridge)
-        if len(matches) != 1 or not record_id(matches[0]):
-            raise LabError(f"could not resolve RouterOS bridge {self.lab_bridge}")
-        return matches[0]
-
-    def bridge_port_record(self, interface):
-        matches = [
-            item for item in records(self.router.get("interface/bridge/port"))
-            if item.get("bridge") == self.lab_bridge and item.get("interface") == interface
-        ]
-        if len(matches) != 1 or not record_id(matches[0]):
-            raise LabError(f"could not resolve bridge port {interface} on {self.lab_bridge}")
-        return matches[0]
-
-    def set_bridge_port(self, interface, values):
-        item = self.bridge_port_record(interface)
-        quoted = urllib.parse.quote(str(record_id(item)), safe="*-")
-        self.router.set(f"interface/bridge/port/{quoted}", values)
-
-    def arm_vlan_guard(self):
-        clock = self.router.get("system/clock")
-        if not isinstance(clock, dict) or not clock.get("time"):
-            raise LabError("RouterOS clock is unavailable for the VLAN recovery guard")
-        try:
-            start = dt.datetime.strptime(clock["time"], "%H:%M:%S") + dt.timedelta(minutes=3)
-        except ValueError as exc:
-            raise LabError(f"could not parse RouterOS clock: {clock}") from exc
-        if start.day != 1:
-            raise LabError("RouterOS VLAN guard cannot be armed across midnight")
-        source = (
-            f'/interface bridge set [find where name="{self.lab_bridge}"] vlan-filtering=no; '
-            f'/interface bridge port set [find where interface="{self.args.router_control_interface}"] '
-            'disabled=no pvid=1 frame-types=admit-all; '
-            f'/interface bridge port set [find where interface="{self.args.router_interface}"] '
-            'disabled=no pvid=1 frame-types=admit-all'
-        )
-        self.router.add(
-            "system/scheduler",
-            {
-                "name": LAB_GUARD,
-                "start-date": clock.get("date", ""),
-                "start-time": start.strftime("%H:%M:%S"),
-                "interval": "0s",
-                "on-event": source,
-                "comment": f"{TAG}: automatic bridge recovery",
-            },
-        )
-
-    def cancel_vlan_guard(self):
-        for item in self.matching("system/scheduler", "name", LAB_GUARD):
-            if record_id(item):
-                self.router.remove("system/scheduler", record_id(item))
-
-    def add_bridge_vlan(self, vlan_id, tagged="", untagged=""):
-        values = {
-            "bridge": self.lab_bridge,
-            "vlan-ids": str(vlan_id),
-            "comment": f"{TAG}: VLAN {vlan_id}",
-        }
-        if tagged:
-            values["tagged"] = tagged
-        if untagged:
-            values["untagged"] = untagged
-        self.router.add("interface/bridge/vlan", values)
-
-    def add_vlan_interface(self, name, vlan_id):
-        self.router.add(
-            "interface/vlan",
-            {
-                "name": name,
-                "interface": self.lab_bridge,
-                "vlan-id": str(vlan_id),
-                "comment": f"{TAG}: VLAN {vlan_id} endpoint",
-            },
-        )
-
-    def setup_vlan_lab(self):
-        self.remove_dhcp_clients()
-        self.arm_vlan_guard()
-        self.set_bridge_port(
-            self.args.router_control_interface,
-            {"disabled": "false", "pvid": "1", "frame-types": "admit-all", "ingress-filtering": "true"},
-        )
-        self.set_bridge_port(
-            self.args.router_interface,
-            {"disabled": "false", "pvid": "30", "frame-types": "admit-all", "ingress-filtering": "true"},
-        )
-        for item in records(self.router.get("interface/bridge/port")):
-            if (
-                item.get("bridge") == self.lab_bridge
-                and item.get("interface") not in (self.args.router_control_interface, self.args.router_interface)
-                and record_id(item)
-            ):
-                quoted = urllib.parse.quote(str(record_id(item)), safe="*-")
-                self.router.set(f"interface/bridge/port/{quoted}", {"disabled": "true"})
-
-        self.add_bridge_vlan(1, untagged=f"{self.lab_bridge},{self.args.router_control_interface}")
-        self.add_bridge_vlan(10, tagged=f"{self.lab_bridge},{self.args.router_interface}")
-        self.add_bridge_vlan(20, tagged=f"{self.lab_bridge},{self.args.router_interface}")
-        self.add_bridge_vlan(30, tagged=self.lab_bridge, untagged=self.args.router_interface)
-        self.add_vlan_interface(LAB_UPSTREAM, 10)
-        self.add_vlan_interface(LAB_DOWNSTREAM, 20)
-        self.add_vlan_interface(LAB_MANAGEMENT, 30)
-
-        main_vrf = self.matching("ip/vrf", "name", "main")
-        vrf_values = {"name": LAB_VRF, "interfaces": LAB_DOWNSTREAM}
-        if main_vrf:
-            vrf_values["place-before"] = "0"
-        self.router.add("ip/vrf", vrf_values)
-        self.router.add(
-            "ipv6/address",
-            {
-                "address": NDP_UPSTREAM_ADDRESS,
-                "interface": LAB_UPSTREAM,
-                "advertise": "false",
-                "comment": f"{TAG}: upstream /64",
-            },
-        )
-        self.router.add(
-            "ip/address",
-            {
-                "address": "192.168.1.254/24",
-                "interface": LAB_MANAGEMENT,
-                "comment": f"{TAG}: LuCI management",
-            },
-        )
-        self.set_ipv6_setting("yes")
-        self.router.add(
-            "ipv6/dhcp-client",
-            {
-                "interface": LAB_DOWNSTREAM,
-                "request": "address",
-                "use-peer-dns": "false",
-                "disabled": "false",
-                "comment": f"{TAG}-ndp_proxy",
-            },
-        )
-
-        place_before = place_before_first(self.router.get("ip/firewall/filter"))
-        filter_values = {
-            "chain": "forward", "action": "accept", "protocol": "tcp",
-            "src-address": self.args.host_address, "dst-address": "192.168.1.1",
-            "dst-port": "80", "comment": f"{TAG}-luci-forward",
-        }
-        if place_before:
-            filter_values["place-before"] = place_before
-        self.router.add("ip/firewall/filter", filter_values)
-        self.router.add(
-            "ip/firewall/nat",
-            {
-                "chain": "dstnat", "action": "dst-nat", "protocol": "tcp",
-                "dst-address": self.args.router_address, "dst-port": "8080",
-                "to-addresses": "192.168.1.1", "to-ports": "80",
-                "comment": f"{TAG}-luci-dstnat",
-            },
-        )
-        self.router.add(
-            "ip/firewall/nat",
-            {
-                "chain": "srcnat", "action": "masquerade", "protocol": "tcp",
-                "dst-address": "192.168.1.1", "dst-port": "80",
-                "out-interface": LAB_MANAGEMENT,
-                "comment": f"{TAG}-luci-srcnat",
-            },
-        )
-
-        bridge = self.bridge_record()
-        quoted = urllib.parse.quote(str(record_id(bridge)), safe="*-")
-        self.router.set(f"interface/bridge/{quoted}", {"vlan-filtering": "true"})
-        self.wait_for(
-            "RouterOS REST after VLAN filtering",
-            lambda: records(self.router.get("system/resource")),
-            timeout=45,
-        )
-        self.cancel_vlan_guard()
 
     def disable_bridge_membership(self):
         for item in self.matching("interface/bridge/port", "interface", self.args.router_interface):
@@ -968,24 +700,8 @@ class IPv6Lab:
             self.flash_complete = True
 
         self.remove_tagged()
-        last = {"output": "", "rc": 1}
-
-        def board_services_ready():
-            output, rc = self.serial.command(
-                "mount | grep -q ' /overlay ' && test -d /overlay/upper && { "
-                "ubus list luci.ipv6_test; /usr/sbin/ipv6-test-mode status; }"
-            )
-            last.update({"output": output, "rc": rc})
-            if rc or "luci.ipv6_test" not in output:
-                return None
-            try:
-                status = extract_json(output)
-            except LabError:
-                return None
-            return output if status.get("ok") is True else None
-
-        output = self.wait_for("IPv6-test services after boot", board_services_ready, timeout=120)
-        self.log.assertion("new IPv6-test image booted", True, output or last)
+        output, rc = self.serial.command("ubus list luci.ipv6_test; /usr/sbin/ipv6-test-mode status")
+        self.log.assertion("new IPv6-test image booted", rc == 0 and "luci.ipv6_test" in output, output)
 
     def board_rpc(self, method, values=None):
         payload = json.dumps(values or {}, separators=(",", ":"))
@@ -1012,38 +728,19 @@ class IPv6Lab:
         self.router.set(path, {"disabled": "true"})
         time.sleep(1)
         self.router.set(path, {"disabled": "false"})
-        self.wait_for(
-            f"RouterOS {self.args.router_interface} link",
-            lambda: boolish(self.router_ethernet().get("running", "false")),
-            timeout=45,
-        )
-        time.sleep(2)
 
-    def start_ra_capture(self, interface="br-lan"):
+    def start_ra_capture(self):
         command = (
             "rm -f /tmp/ipv6-lab-ra.txt /tmp/ipv6-lab-ra.pid; "
-            f"tcpdump -lnvv -c 1 -i {shlex.quote(interface)} 'icmp6 && ip6[40] == 134' "
+            "tcpdump -lnvv -c 1 -i br-lan 'icmp6 && ip6[40] == 134' "
             ">/tmp/ipv6-lab-ra.txt 2>&1 & echo $! >/tmp/ipv6-lab-ra.pid"
         )
         output, rc = self.serial.command(command)
         if rc:
             raise LabError(f"could not start RA capture: {output}")
-        time.sleep(1)
-        self.serial.send_line(
-            "/etc/init.d/odhcpd restart >/tmp/ipv6-lab-odhcpd-restart.log 2>&1"
-        )
-        time.sleep(3)
-        output, rc = self.serial.command(
-            "/etc/init.d/odhcpd running || { "
-            "cat /tmp/ipv6-lab-odhcpd-restart.log; false; }"
-        )
-        if rc:
-            raise LabError(f"could not trigger router advertisement: {output}")
 
     def finish_ra_capture(self, mode):
-        # The physical MT7628/RouterOS link can need roughly ten seconds to
-        # renegotiate after a port toggle. Keep the capture open beyond that.
-        time.sleep(15)
+        time.sleep(5)
         output, _ = self.serial.command(
             "test ! -s /tmp/ipv6-lab-ra.pid || kill $(cat /tmp/ipv6-lab-ra.pid) 2>/dev/null; "
             "cat /tmp/ipv6-lab-ra.txt",
@@ -1051,12 +748,12 @@ class IPv6Lab:
         (self.log.results_dir / f"ra-{mode}.txt").write_text(output + "\n", encoding="utf-8")
         self.log.assertion(f"{mode} RA flags", ra_matches(output, mode), output)
 
-    def add_dhcp_client(self, request_kind, mode, interface=None):
+    def add_dhcp_client(self, request_kind, mode):
         self.remove_dhcp_clients()
         self.router.add(
             "ipv6/dhcp-client",
             {
-                "interface": interface or self.args.router_interface,
+                "interface": self.args.router_interface,
                 "request": request_kind,
                 "use-peer-dns": "true",
                 "disabled": "false",
@@ -1089,22 +786,20 @@ class IPv6Lab:
             time.sleep(2)
         return last
 
-    def prefix_address(self, prefix, interface=None):
+    def prefix_address(self, prefix):
         base = prefix.split("::", 1)[0].lower()
-        expected_interface = interface or self.args.router_interface
         for item in records(self.router.get("ipv6/address")):
             address = item.get("address", "").lower()
-            if item.get("interface") == expected_interface and address.startswith(base + ":"):
+            if item.get("interface") == self.args.router_interface and address.startswith(base + ":"):
                 return item
         return None
 
-    def default_route(self, interface=None):
-        expected_interface = interface or self.args.router_interface
+    def default_route(self):
         for item in records(self.router.get("ipv6/route")):
             gateway = str(item.get("gateway", "")) + str(item.get("immediate-gw", ""))
             on_test_interface = (
-                item.get("interface") == expected_interface
-                or expected_interface in gateway
+                item.get("interface") == self.args.router_interface
+                or self.args.router_interface in gateway
             )
             if (
                 item.get("dst-address") in ("::/0", "0::/0")
@@ -1114,7 +809,7 @@ class IPv6Lab:
                 return item
         return None
 
-    def dhcp_client_bound(self, mode, prefix, require_address, interface=None):
+    def dhcp_client_bound(self, mode, prefix, require_address):
         base = prefix.split("::", 1)[0].lower()
         for item in records(self.router.get("ipv6/dhcp-client")):
             acceptable_status = ("bound",) if require_address else ("bound", "idle")
@@ -1122,8 +817,6 @@ class IPv6Lab:
                 item.get("comment") != f"{TAG}-{mode}"
                 or item.get("status") not in acceptable_status
             ):
-                continue
-            if interface and item.get("interface") != interface:
                 continue
             address = str(item.get("address", "")).lower()
             if require_address and not address.startswith(base + ":"):
@@ -1138,11 +831,10 @@ class IPv6Lab:
         dynamic = str(dns[0].get("dynamic-servers", "")).lower()
         return dns[0] if address.lower() in dynamic else None
 
-    def router_ping(self, address, interface=None, vrf=None):
-        values = {"address": address, "count": "3", "interface": interface or self.args.router_interface}
-        if vrf:
-            values["vrf"] = vrf
-        result = self.router.command("ping", values)
+    def router_ping(self, address):
+        result = self.router.command(
+            "ping", {"address": address, "count": "3", "interface": self.args.router_interface}
+        )
         for item in records(result):
             status = str(item.get("status", "")).lower()
             if status == "echo reply":
@@ -1164,92 +856,13 @@ class IPv6Lab:
         except LabError:
             return False
 
-    def firewall_packets(self, comment="IPv6 test mode: block forwarded traffic"):
+    def firewall_packets(self):
         output, rc = self.serial.command(
-            f"nft -a list table inet fw4 | grep -F {shlex.quote(comment)}"
+            "nft -a list table inet fw4 | grep -F 'IPv6 test mode: block forwarded traffic'"
         )
         if rc:
             raise LabError(f"IPv6 forwarding rule not found: {output}")
         return parse_firewall_packets(output)
-
-    def toggle_router_vlan(self, name):
-        matches = self.matching("interface/vlan", "name", name)
-        if len(matches) != 1 or not record_id(matches[0]):
-            raise LabError(f"could not resolve RouterOS VLAN interface {name}")
-        quoted = urllib.parse.quote(str(record_id(matches[0])), safe="*-")
-        path = f"interface/vlan/{quoted}"
-        self.router.set(path, {"disabled": "true"})
-        time.sleep(1)
-        self.router.set(path, {"disabled": "false"})
-        self.wait_for(
-            f"RouterOS VLAN {name}",
-            lambda: boolish(self.matching("interface/vlan", "name", name)[0].get("running", "false"))
-            if self.matching("interface/vlan", "name", name) else False,
-            timeout=30,
-        )
-        time.sleep(2)
-
-    def flush_router_neighbor(self, address):
-        for item in records(self.router.get("ipv6/neighbor")):
-            if (
-                str(item.get("address", "")).lower() == address.lower()
-                and item.get("interface") == LAB_UPSTREAM
-                and record_id(item)
-            ):
-                self.router.remove("ipv6/neighbor", record_id(item))
-
-    def start_proxy_capture(self):
-        command = (
-            "rm -f /tmp/ipv6-lab-upstream.txt /tmp/ipv6-lab-downstream.txt "
-            "/tmp/ipv6-lab-upstream.pid /tmp/ipv6-lab-downstream.pid; "
-            "tcpdump -lnvv -i eth0.10 'icmp6' >/tmp/ipv6-lab-upstream.txt 2>&1 & "
-            "echo $! >/tmp/ipv6-lab-upstream.pid; "
-            "tcpdump -lnvv -i eth0.20 'icmp6' >/tmp/ipv6-lab-downstream.txt 2>&1 & "
-            "echo $! >/tmp/ipv6-lab-downstream.pid"
-        )
-        output, rc = self.serial.command(command)
-        if rc:
-            raise LabError(f"could not start proxy captures: {output}")
-        time.sleep(1)
-
-    def finish_proxy_capture(self):
-        time.sleep(2)
-        output, _ = self.serial.command(
-            "for p in /tmp/ipv6-lab-upstream.pid /tmp/ipv6-lab-downstream.pid; do "
-            "test ! -s $p || kill $(cat $p) 2>/dev/null; done; wait 2>/dev/null; "
-            "printf '\\n__UPSTREAM__\\n'; cat /tmp/ipv6-lab-upstream.txt; "
-            "printf '\\n__DOWNSTREAM__\\n'; cat /tmp/ipv6-lab-downstream.txt"
-        )
-        upstream, _, downstream = output.partition("__DOWNSTREAM__")
-        upstream = upstream.replace("__UPSTREAM__", "").strip()
-        downstream = downstream.strip()
-        (self.log.results_dir / "ndp-proxy-upstream.txt").write_text(upstream + "\n", encoding="utf-8")
-        (self.log.results_dir / "ndp-proxy-downstream.txt").write_text(downstream + "\n", encoding="utf-8")
-        return upstream, downstream
-
-    def luci_proxy_available(self):
-        base = f"http://{self.args.router_address}:8080"
-        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
-
-        def fetch(path):
-            try:
-                with opener.open(base + path, timeout=10) as response:
-                    return response.status, response.read().decode("utf-8", "replace")
-            except urllib.error.HTTPError as exc:
-                return exc.code, exc.read().decode("utf-8", "replace")
-
-        try:
-            status, body = fetch("/cgi-bin/luci/admin/network/ipv6-test-mode")
-            asset_status, asset = fetch(
-                "/luci-static/resources/view/network/ipv6-test-mode.js"
-            )
-        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
-            return False
-        (self.log.results_dir / "luci-proxy-response.html").write_text(body, encoding="utf-8")
-        (self.log.results_dir / "luci-ipv6-test-mode.js").write_text(asset, encoding="utf-8")
-        page_ok = status in (200, 302, 403) and ("luci" in body.lower() or status in (302, 403))
-        asset_ok = asset_status == 200 and "NDP Proxy /80" in asset and "ndp_proxy" in asset
-        return page_ok and asset_ok
 
     def run_mode(self, mode, prefix, request_kind):
         failures = []
@@ -1298,148 +911,8 @@ class IPv6Lab:
         self.log.assertion(f"{mode} OpenWrt client observation", True, observation)
         return failures
 
-    def run_proxy_mode(self):
-        self.setup_vlan_lab()
-        status = self.board_rpc(
-            "apply",
-            {
-                "mode": "ndp_proxy",
-                "prefix": DEFAULT_PREFIX,
-                "downstream_prefix": NDP_DOWNSTREAM_PREFIX,
-            },
-        )
-        self.log.assertion(
-            "NDP proxy board status",
-            status.get("ok") is True
-            and status.get("mode") == "ndp_proxy"
-            and status.get("topology") == "vlan_proxy"
-            and all(status.get(key) is True for key in (
-                "upstream_address_active", "downstream_address_active", "route_active",
-                "ndppd_running", "dhcpv6_server_running", "forwarding_allowed", "odhcpd_running",
-            )),
-            status,
-        )
-        self.start_ra_capture("eth0.20")
-        self.toggle_router_vlan(LAB_DOWNSTREAM)
-        self.finish_ra_capture("ndp_proxy")
-
-        dhcp = self.wait_for(
-            "RouterOS lab-VRF DHCPv6 address",
-            lambda: self.dhcp_client_bound(
-                "ndp_proxy", NDP_DOWNSTREAM_PREFIX, require_address=True,
-                interface=LAB_DOWNSTREAM,
-            ),
-            timeout=90,
-        )
-        client_address = str(dhcp.get("address", "")).split(",", 1)[0].split("/", 1)[0].strip()
-        self.log.assertion(
-            "NDP proxy IA_NA prefix",
-            client_address.lower().startswith(NDP_CLIENT_PREFIX),
-            dhcp,
-        )
-        route = self.wait_for(
-            "RouterOS lab-VRF default route",
-            lambda: self.default_route(LAB_DOWNSTREAM),
-            timeout=45,
-        )
-        self.log.assertion("NDP proxy lab-VRF default route", bool(route), route)
-
-        routes = records(self.router.get("ipv6/route"))
-        upstream_bypass = [
-            item for item in routes
-            if item.get("dst-address") == NDP_DOWNSTREAM_PREFIX
-            and (
-                item.get("interface") == LAB_UPSTREAM
-                or LAB_UPSTREAM in str(item.get("gateway", ""))
-                or LAB_UPSTREAM in str(item.get("immediate-gw", ""))
-            )
-        ]
-        self.log.assertion("no explicit upstream /80 route", not upstream_bypass, upstream_bypass)
-
-        self.log.assertion("LuCI reachable through RouterOS VLAN 30", self.luci_proxy_available())
-
-        before_up = self.firewall_packets("IPv6 test proxy: upstream to downstream")
-        before_down = self.firewall_packets("IPv6 test proxy: downstream to upstream")
-        self.start_proxy_capture()
-        try:
-            self.flush_router_neighbor(client_address)
-            reachable = self.router_ping(client_address, interface=LAB_UPSTREAM)
-        finally:
-            upstream_capture, downstream_capture = self.finish_proxy_capture()
-        after_up = self.firewall_packets("IPv6 test proxy: upstream to downstream")
-        after_down = self.firewall_packets("IPv6 test proxy: downstream to upstream")
-        self.log.assertion("NDP proxy routed ping", reachable, client_address)
-        self.log.assertion(
-            "NDP proxy packet traversal",
-            proxy_capture_matches(upstream_capture, downstream_capture),
-            {"upstream": upstream_capture[-2000:], "downstream": downstream_capture[-2000:]},
-        )
-        self.log.assertion(
-            "NDP proxy firewall forwarding counter",
-            after_up > before_up and after_down >= before_down,
-            f"up {before_up}->{after_up}; down {before_down}->{after_down}",
-        )
-
-        def observed_client():
-            observation = self.board_rpc("get_status")
-            return observation if client_observation_matches(
-                observation, "ndp_proxy", client_address
-            ) else None
-
-        observation = self.wait_for("NDP proxy OpenWrt client observation", observed_client, timeout=30)
-        self.log.assertion("NDP proxy OpenWrt client observation", True, observation)
-
-        output, rc = self.serial.command("/etc/init.d/ndppd stop")
-        self.log.assertion("stop ndppd for negative test", rc == 0, output)
-        self.flush_router_neighbor(client_address)
-        self.log.assertion(
-            "NDP proxy negative reachability",
-            not self.router_ping(client_address, interface=LAB_UPSTREAM),
-            client_address,
-        )
-        output, rc = self.serial.command("/etc/init.d/ndppd restart")
-        self.log.assertion("restart ndppd after negative test", rc == 0, output)
-        self.flush_router_neighbor(client_address)
-        self.log.assertion(
-            "NDP proxy reachability restored",
-            self.wait_for(
-                "reachability after ndppd restart",
-                lambda: self.router_ping(client_address, interface=LAB_UPSTREAM),
-                timeout=45,
-            ),
-            client_address,
-        )
-
-        invalid = self.board_rpc(
-            "apply",
-            {
-                "mode": "ndp_proxy",
-                "prefix": DEFAULT_PREFIX,
-                "downstream_prefix": "fd42:6970:7636:2:a69::/80",
-            },
-        )
-        current = self.board_rpc("get_status")
-        self.log.assertion(
-            "invalid /80 rollback",
-            bool(invalid.get("error"))
-            and current.get("mode") == "ndp_proxy"
-            and current.get("downstream_prefix") == NDP_DOWNSTREAM_PREFIX,
-            {"invalid": invalid, "current": current},
-        )
-
     def run_scenarios(self):
         failures = []
-        if self.args.proxy_only:
-            self.run_proxy_mode()
-            disabled = self.board_rpc("disable")
-            self.log.assertion(
-                "proxy-only final disabled state",
-                disabled.get("ok") is True
-                and disabled.get("enabled") is False
-                and disabled.get("active_mode") == "disabled",
-                disabled,
-            )
-            return
         self.disable_bridge_membership()
         self.set_ipv6_setting("yes")
 
@@ -1490,8 +963,6 @@ class IPv6Lab:
             {"invalid": invalid, "current": current},
         )
 
-        self.run_proxy_mode()
-
         disabled = self.board_rpc("disable")
         self.log.assertion(
             "disable mode",
@@ -1502,6 +973,8 @@ class IPv6Lab:
             and disabled.get("dhcpv6_bound") is False,
             disabled,
         )
+        self.log.assertion("disabled router address unreachable", not self.router_ping("fd42:6970:7636:2::1"))
+
         if self.args.final_mode == "disabled":
             final = self.board_rpc("disable")
             self.log.assertion(
@@ -1554,22 +1027,7 @@ class IPv6Lab:
                 self.flash_complete = True
             else:
                 self.flash(preflight["image"], preflight["sha256"])
-            forwarding_text, rc = self.serial.command(
-                "cat /proc/sys/net/ipv6/conf/all/forwarding"
-            )
-            if rc or forwarding_text.strip() not in ("0", "1"):
-                raise LabError(f"could not read pre-scenario IPv6 forwarding: {forwarding_text}")
-            self.board_forwarding_before = forwarding_text.strip()
-            self.log.summary["board_forwarding_before_scenarios"] = self.board_forwarding_before
             self.run_scenarios()
-            forwarding_text, rc = self.serial.command(
-                "cat /proc/sys/net/ipv6/conf/all/forwarding"
-            )
-            self.log.assertion(
-                "board IPv6 forwarding restored",
-                rc == 0 and forwarding_text.strip() == self.board_forwarding_before,
-                f"{self.board_forwarding_before}->{forwarding_text.strip()}",
-            )
         except LabError as exc:
             primary_error = exc
         finally:
@@ -1609,7 +1067,6 @@ def add_common(parser):
     parser.add_argument("--router-url", default="http://192.168.50.1")
     parser.add_argument("--router-user", default="admin")
     parser.add_argument("--router-interface", default="ether2")
-    parser.add_argument("--router-control-interface", default="ether1")
     parser.add_argument("--router-address", default="192.168.50.1")
     parser.add_argument("--host-address", default="192.168.50.2")
     parser.add_argument("--serial", required=True, help="currently enumerated /dev/cu.* device")
@@ -1632,22 +1089,16 @@ def parse_args(argv=None):
     run = subparsers.add_parser("run", help="flash and execute the destructive live test")
     add_common(run)
     run.add_argument("--confirm-device-changes", action="store_true")
-    run.add_argument("--final-mode", choices=("stateless", "disabled"), default="disabled")
+    run.add_argument("--final-mode", choices=("stateless", "disabled"), default="stateless")
     run.add_argument(
         "--skip-flash",
         action="store_true",
         help="resume tests on an already verified IPv6-test image",
     )
-    run.add_argument(
-        "--proxy-only",
-        action="store_true",
-        help="run only the VLAN/VRF NDP-proxy scenario on an already validated image",
-    )
     restore = subparsers.add_parser("restore", help="restore RouterOS from a saved snapshot")
     restore.add_argument("--router-url", default="http://192.168.50.1")
     restore.add_argument("--router-user", default="admin")
     restore.add_argument("--router-interface", default="ether2")
-    restore.add_argument("--router-control-interface", default="ether1")
     restore.add_argument("--snapshot", required=True)
     restore.add_argument("--results-dir", default=default_results_dir())
     restore.add_argument("--allow-insecure-http", action="store_true")
