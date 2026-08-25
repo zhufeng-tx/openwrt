@@ -7,7 +7,7 @@ HELPER="/usr/sbin/ipv6-test-mode"
 
 case "$1" in
 list)
-	echo '{"get_status":{},"apply":{"mode":"String","prefix":"String"},"disable":{}}'
+	echo '{"get_status":{},"apply":{"mode":"String","prefix":"String","downstream_prefix":"String"},"disable":{}}'
 	;;
 call)
 	case "$2" in
@@ -17,10 +17,12 @@ call)
 	apply)
 		mode=""
 		prefix=""
+		downstream_prefix=""
 		json_load "$(cat)"
 		json_get_var mode mode
 		json_get_var prefix prefix
-		output="$("$HELPER" apply "$mode" "$prefix")"
+		json_get_var downstream_prefix downstream_prefix
+		output="$("$HELPER" apply "$mode" "$prefix" "$downstream_prefix")"
 		if [ -n "$output" ]; then
 			printf '%s\n' "$output"
 		else

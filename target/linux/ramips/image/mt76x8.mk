@@ -33,7 +33,7 @@ define Device/devboard_wifi-test-board-hiwooya-16m-ipv6-test
   DEVICE_VARIANT := Hiwooya 16M IPv6 Test
   DEVICE_DTS := mt7628an_devboard_wifi-test-board-hiwooya-16m
   SUPPORTED_DEVICES := devboard,wifi-test-board-hiwooya-16m
-  DEVICE_PACKAGES += firewall4 dnsmasq ndppd odhcpd-ipv6only luci-light \
+  DEVICE_PACKAGES += firewall4 dnsmasq-dhcpv6 ndppd odhcpd-ipv6only luci-light \
 	luci-app-ipv6-test-mode -wltp -openwrt-mcpd -hgpriv
 endef
 TARGET_DEVICES += devboard_wifi-test-board-hiwooya-16m-ipv6-test
