@@ -1,7 +1,8 @@
 # MikroTik IPv6 lab test
 
 `scripts/ipv6-lab-test.py` validates this package on a Hiwooya 16M MT7628
-board with MikroTik RouterOS `ether2` acting as the only IPv6 client. The Mac
+board with MikroTik RouterOS `ether2` acting as an IPv6 host or downstream
+router. The Mac
 is used only for RouterOS management, serial control, image serving, and
 evidence collection.
 
@@ -83,8 +84,10 @@ python3 scripts/ipv6-lab-test.py run \
 ```
 
 The run fails before flashing if RouterOS cannot create disabled DHCPv6
-clients with both `request=info` and `request=address`. Prefix delegation is
-not substituted for IA_NA address assignment.
+clients with `request=info`, `request=address`, and `request=prefix`. The PD
+probe also checks the `pool-name`, `pool-prefix-length=64`, and
+`prefix-hint=::/64` properties. Prefix delegation is not substituted for IA_NA
+address assignment.
 
 If automatic cleanup reports exit code 3, retain the evidence directory and
 restore from its snapshot:
@@ -102,10 +105,18 @@ enables test mode, and it isolates `ether2` first.
 ## Acceptance scenarios
 
 The harness exercises first-boot service health, stateless RA plus DHCPv6
-information, stateful DHCPv6 IA_NA, local DNS (`router.ipv6.test`), ICMPv6,
-actual forwarding-rule counter growth, invalid-prefix rollback, disable, and
-the selected final state. The normal final state is the default stateless
-prefix `fd42:6970:7636:1::/64`; shared-bridge runs require disabled mode.
+information, stateful DHCPv6 IA_NA, and stateless LAN addressing combined with
+DHCPv6 IA_PD. The PD scenario verifies RouterOS binding to a distinct /64,
+odhcpd lease visibility, and the installed downstream route. It also covers
+local DNS (`router.ipv6.test`), ICMPv6, actual forwarding-rule counter growth,
+invalid-prefix rollback, disable, and the selected final state. The normal
+final state is the default stateless prefix `fd42:6970:7636:1::/64`;
+shared-bridge runs require disabled mode.
+
+The connected RouterOS router proves delegation, dynamic pool creation, and
+the devboard route. End-to-end SLAAC and traffic from a client behind RouterOS
+still require a separately identified, isolated downstream interface and a
+real downstream client.
 
 Run host-side tests with:
 

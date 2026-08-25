@@ -78,6 +78,29 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(LAB.ra_matches(stateless, "stateful"))
         self.assertTrue(LAB.ra_matches(stateful, "stateful"))
         self.assertFalse(LAB.ra_matches(stateful, "stateless"))
+        self.assertTrue(LAB.ra_matches(stateless, "stateless_pd"))
+
+    def test_prefix_delegation_layout_reserves_first_lan_64(self):
+        self.assertEqual("fd42:6970:7636::/64", LAB.first_lan_prefix(LAB.PD_PREFIX))
+        self.assertEqual("fd42:6970:7636::1", LAB.first_router_address(LAB.PD_PREFIX))
+        self.assertTrue(LAB.delegated_prefix_matches("fd42:6970:7636:1::/64", LAB.PD_PREFIX))
+        self.assertFalse(LAB.delegated_prefix_matches("fd42:6970:7636::/64", LAB.PD_PREFIX))
+        self.assertFalse(LAB.delegated_prefix_matches("fd42:6970:7637::/64", LAB.PD_PREFIX))
+        self.assertTrue(LAB.address_in_prefix("fd42:6970:7636::a/64", "fd42:6970:7636::/64"))
+        self.assertFalse(LAB.address_in_prefix("fd42:6970:7636:1::a/64", "fd42:6970:7636::/64"))
+
+    def test_pd_ra_advertises_only_the_lan_64(self):
+        capture = "prefix info option: fd42:6970:7636::/64, Flags [onlink, auto]"
+        self.assertTrue(LAB.ra_prefix_matches(capture, "fd42:6970:7636::/64", LAB.PD_PREFIX))
+        self.assertFalse(LAB.ra_prefix_matches("prefix info option: fd42:6970:7636::/48", "fd42:6970:7636::/64", LAB.PD_PREFIX))
+        extra = capture + "\nprefix info option: fd0a:6a05:b19d::/64, Flags [onlink, auto]"
+        self.assertFalse(LAB.ra_prefix_matches(extra, "fd42:6970:7636::/64", LAB.PD_PREFIX))
+
+    def test_routeros_prefix_strips_lease_lifetime(self):
+        self.assertEqual(
+            "fd42:6970:7636:1::/64",
+            LAB.routeros_prefix("fd42:6970:7636:1::/64, 11h59m15s"),
+        )
 
     def test_serial_frame_uses_emitted_marker_after_echoed_command(self):
         marker = "__IPV6_LAB_1_1"
@@ -87,6 +110,13 @@ class ParserTests(unittest.TestCase):
             "%s_BEGIN\r\n{\"ok\":true}\r\n%s_RC=0\r\nroot@OpenWrt:/# "
         ) % (marker, marker, marker, marker)
         self.assertEqual(("{\"ok\":true}", 0), LAB.parse_serial_frame(raw, marker))
+
+    def test_sysupgrade_failure_detection(self):
+        self.assertEqual(
+            "failed to exec sysupgrade",
+            LAB.sysupgrade_failure("Failed to exec sysupgrade\nsysupgrade aborted with return code: 256"),
+        )
+        self.assertIsNone(LAB.sysupgrade_failure("Writing from <stdin> to firmware ... [e]\nRebooting system"))
 
     def test_serial_transport_is_tio_at_project_baud(self):
         command = LAB.tio_command("/dev/cu.usbserial-CURRENT", 57600)
@@ -255,6 +285,7 @@ class FakeRouter:
             "ipv6/address": [],
             "ipv6/route": [],
             "ipv6/dhcp-client": [],
+            "ipv6/pool": [],
             "ip/dns": [{}],
             "ip/firewall/filter": [],
             "ip/firewall/nat": [],
@@ -285,6 +316,16 @@ class PingRouter:
 
     def command(self, _path, _values):
         return self.result
+
+
+class SerialCommands:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.commands = []
+
+    def command(self, command, timeout=30):
+        self.commands.append((command, timeout))
+        return next(self.responses)
 
 
 class RestorationTests(unittest.TestCase):
@@ -358,6 +399,53 @@ class RestorationTests(unittest.TestCase):
             ]
             lab.router = fake
             self.assertIsNotNone(lab.dhcp_client_bound("stateless", LAB.DEFAULT_PREFIX, False))
+
+    def test_pd_pool_matches_the_bound_delegation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                results_dir=directory,
+                router_url="http://127.0.0.1",
+                router_user="admin",
+                router_interface="ether2",
+            )
+            lab = LAB.IPv6Lab(args, "secret")
+            fake = FakeRouter()
+            fake.data["ipv6/pool"] = [
+                {
+                    "name": LAB.TAG + "-pd",
+                    "prefix": "fd42:6970:7636:1::/64",
+                    "prefix-length": "64",
+                    "dynamic": "true",
+                }
+            ]
+            lab.router = fake
+            self.assertIsNotNone(lab.pd_pool("fd42:6970:7636:1::/64"))
+            self.assertIsNone(lab.pd_pool("fd42:6970:7636:2::/64"))
+
+    def test_sysupgrade_bootstrap_is_selected_for_old_live_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                results_dir=directory,
+                router_url="http://127.0.0.1",
+                router_user="admin",
+                router_interface="ether2",
+            )
+            lab = LAB.IPv6Lab(args, "secret")
+            lab.serial = SerialCommands([("", 1), ("", 0)])
+            self.assertEqual("/sbin/sysupgrade", lab.prepare_sysupgrade_command())
+            self.assertIn("for script in stage2 do_stage2", lab.serial.commands[1][0])
+
+    def test_board_image_readiness_requires_rpc_and_healthy_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                results_dir=directory,
+                router_url="http://127.0.0.1",
+                router_user="admin",
+                router_interface="ether2",
+            )
+            lab = LAB.IPv6Lab(args, "secret")
+            lab.serial = SerialCommands([('luci.ipv6_test\n{"ok":true}', 0)])
+            self.assertIn("luci.ipv6_test", lab.wait_board_image_ready(timeout=1))
 
     def test_ping_requires_echo_reply_not_icmp_error(self):
         with tempfile.TemporaryDirectory() as directory:

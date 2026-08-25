@@ -13,6 +13,7 @@ import datetime as dt
 import getpass
 import hashlib
 import http.server
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,7 @@ import urllib.request
 TAG = "openwrt-ipv6-lab"
 DEFAULT_PREFIX = "fd42:6970:7636:1::/64"
 STATEFUL_PREFIX = "fd42:6970:7636:2::/64"
+PD_PREFIX = "fd42:6970:7636::/48"
 DEFAULT_IMAGE = (
     "bin/targets/ramips/mt76x8/"
     "openwrt-ramips-mt76x8-devboard_wifi-test-board-hiwooya-16m-"
@@ -140,9 +142,51 @@ def ra_matches(text, mode):
     managed = "managed" in lowered
     other = "other stateful" in lowered or "other-config" in lowered
     autonomous = bool(re.search(r"\bauto(?:nomous)?\b", lowered))
-    if mode == "stateless":
+    if mode in ("stateless", "stateless_pd"):
         return not managed and other and autonomous
     return managed and not other and not autonomous
+
+
+def first_lan_prefix(prefix):
+    network = ipaddress.IPv6Network(prefix)
+    if network.prefixlen >= 64:
+        return str(network)
+    return str(next(network.subnets(new_prefix=64)))
+
+
+def first_router_address(prefix):
+    return str(ipaddress.IPv6Network(first_lan_prefix(prefix)).network_address + 1)
+
+
+def address_in_prefix(address, prefix):
+    try:
+        return ipaddress.IPv6Interface(address).ip in ipaddress.IPv6Network(prefix)
+    except ValueError:
+        return False
+
+
+def delegated_prefix_matches(prefix, aggregate):
+    try:
+        delegated = ipaddress.IPv6Network(prefix)
+        pool = ipaddress.IPv6Network(aggregate)
+    except ValueError:
+        return False
+    return delegated.prefixlen == 64 and delegated.subnet_of(pool) and str(delegated) != first_lan_prefix(aggregate)
+
+
+def routeros_prefix(value):
+    return str(value or "").split(",", 1)[0].strip().lower()
+
+
+def ra_prefix_matches(text, lan_prefix, aggregate=None):
+    lowered = text.lower()
+    expected = str(ipaddress.IPv6Network(lan_prefix)).lower()
+    advertised = re.findall(r"prefix info option.*?:\s*([0-9a-f:]+/\d+)", lowered)
+    try:
+        normalized = {str(ipaddress.IPv6Network(prefix)) for prefix in advertised}
+    except ValueError:
+        return False
+    return normalized == {expected}
 
 
 def parse_serial_frame(raw, marker):
@@ -157,6 +201,19 @@ def parse_serial_frame(raw, marker):
         raise LabError(f"serial command returned malformed framing: {raw[-500:]}")
     output = raw[begin + len(begin_token):rc_match.start()].strip("\r\n")
     return output, int(rc_match.group(1))
+
+
+def sysupgrade_failure(text):
+    lowered = text.lower()
+    for marker in (
+        "failed to exec sysupgrade",
+        "failed to exec upgraded",
+        "sysupgrade aborted with return code",
+        "sysupgrade stage 2 failed",
+    ):
+        if marker in lowered:
+            return marker
+    return None
 
 
 def tio_command(device, baud):
@@ -370,15 +427,21 @@ class SerialConsole:
         detail = last_error or LabError(f"serial command timed out: {raw[-500:]}")
         raise LabError(f"{detail}: command={command}")
 
-    def flash_and_wait(self, image_path, timeout=300):
-        self.send_line(f"sysupgrade -n {shlex.quote(image_path)}")
+    def flash_and_wait(self, image_path, sysupgrade_command="/sbin/sysupgrade", timeout=300):
+        self.send_line(
+            f"{shlex.quote(sysupgrade_command)} -n {shlex.quote(image_path)}"
+        )
         raw = self.read_until(BOOT_READY_RE, timeout)
         if b"Please press Enter to activate this console." in raw and not PROMPT_RE.search(raw):
             self.send_line("")
             raw += self.read_until(PROMPT_RE, 30)
         if not PROMPT_RE.search(raw):
             raise LabError("board did not return to a root prompt after sysupgrade")
-        return raw.decode("utf-8", "replace")
+        text = raw.decode("utf-8", "replace")
+        failure = sysupgrade_failure(text)
+        if failure:
+            raise LabError(f"sysupgrade did not write firmware: {failure}")
+        return text
 
 
 class ImageServer:
@@ -462,7 +525,7 @@ class IPv6Lab:
         paths = (
             "system/resource", "interface/ethernet", "interface/bridge/port",
             "ip/address", "ipv6/settings", "ipv6/address", "ipv6/route",
-            "ipv6/dhcp-client", "ip/dns", "ip/firewall/filter", "ip/firewall/nat",
+            "ipv6/dhcp-client", "ipv6/pool", "ip/dns", "ip/firewall/filter", "ip/firewall/nat",
         )
         return {path: self.router.get(path) for path in paths}
 
@@ -602,18 +665,25 @@ class IPv6Lab:
 
     def capability_probe(self):
         failures = []
-        for request_kind in ("address", "info"):
+        for request_kind in ("address", "info", "prefix"):
             comment = f"{TAG}-cap-{request_kind}"
             try:
+                values = {
+                    "interface": self.args.router_interface,
+                    "request": request_kind,
+                    "use-peer-dns": "true",
+                    "disabled": "true",
+                    "comment": comment,
+                }
+                if request_kind == "prefix":
+                    values.update({
+                        "pool-name": f"{TAG}-cap-pd",
+                        "pool-prefix-length": "64",
+                        "prefix-hint": "::/64",
+                    })
                 self.router.add(
                     "ipv6/dhcp-client",
-                    {
-                        "interface": self.args.router_interface,
-                        "request": request_kind,
-                        "use-peer-dns": "true",
-                        "disabled": "true",
-                        "comment": comment,
-                    },
+                    values,
                 )
             except LabError as exc:
                 failures.append(f"request={request_kind}: {exc}")
@@ -648,6 +718,7 @@ class IPv6Lab:
                 "comment": f"{TAG}-flash-address",
             },
         )
+
         management_interface = self.management_interface()
         common = {
             "chain": "forward", "action": "accept", "protocol": "tcp",
@@ -670,6 +741,45 @@ class IPv6Lab:
                 "comment": f"{TAG}-flash-nat",
             },
         )
+
+    def prepare_sysupgrade_command(self):
+        output, rc = self.serial.command(
+            "test -x /lib/upgrade/stage2 && test -x /lib/upgrade/do_stage2"
+        )
+        if rc == 0:
+            self.log.assertion("sysupgrade stage2 available", True, "/sbin/sysupgrade")
+            return "/sbin/sysupgrade"
+
+        patch_command = (
+            "for script in stage2 do_stage2; do "
+            "cp /lib/upgrade/$script /tmp/ipv6-lab-$script; "
+            "chmod 0755 /tmp/ipv6-lab-$script; "
+            "cp /tmp/ipv6-lab-$script /lib/upgrade/$script || exit 1; "
+            "done; test -x /lib/upgrade/stage2 && test -x /lib/upgrade/do_stage2"
+        )
+        output, rc = self.serial.command(patch_command)
+        self.log.assertion("sysupgrade executable bootstrap", rc == 0, output)
+        return "/sbin/sysupgrade"
+
+    def wait_board_image_ready(self, timeout=90):
+        deadline = time.monotonic() + timeout
+        last = ""
+        while time.monotonic() < deadline:
+            output, rc = self.serial.command(
+                "test -x /usr/sbin/ipv6-test-mode && "
+                "ubus list luci.ipv6_test 2>/dev/null && "
+                "/usr/sbin/ipv6-test-mode status",
+                timeout=15,
+            )
+            last = output
+            try:
+                status = extract_json(output)
+            except LabError:
+                status = {}
+            if rc == 0 and "luci.ipv6_test" in output and status.get("ok") is True:
+                return output
+            time.sleep(2)
+        raise AssertionFailure(f"timed out waiting for IPv6-test image readiness; last={last}")
 
     def flash(self, image, digest):
         with ImageServer(self.args.host_address, image) as server:
@@ -695,13 +805,16 @@ class IPv6Lab:
             self.log.assertion("firmware platform validation", rc == 0, output)
             output, rc = self.serial.command("sysupgrade -T /tmp/ipv6-lab-sysupgrade.bin", timeout=60)
             self.log.assertion("sysupgrade test", rc == 0, output)
-            boot_log = self.serial.flash_and_wait("/tmp/ipv6-lab-sysupgrade.bin")
+            sysupgrade_command = self.prepare_sysupgrade_command()
+            boot_log = self.serial.flash_and_wait(
+                "/tmp/ipv6-lab-sysupgrade.bin", sysupgrade_command
+            )
             (self.log.results_dir / "flash-boot.log").write_text(boot_log, encoding="utf-8")
             self.flash_complete = True
 
         self.remove_tagged()
-        output, rc = self.serial.command("ubus list luci.ipv6_test; /usr/sbin/ipv6-test-mode status")
-        self.log.assertion("new IPv6-test image booted", rc == 0 and "luci.ipv6_test" in output, output)
+        output = self.wait_board_image_ready()
+        self.log.assertion("new IPv6-test image booted", True, output)
 
     def board_rpc(self, method, values=None):
         payload = json.dumps(values or {}, separators=(",", ":"))
@@ -739,7 +852,7 @@ class IPv6Lab:
         if rc:
             raise LabError(f"could not start RA capture: {output}")
 
-    def finish_ra_capture(self, mode):
+    def finish_ra_capture(self, mode, lan_prefix, aggregate=None):
         time.sleep(5)
         output, _ = self.serial.command(
             "test ! -s /tmp/ipv6-lab-ra.pid || kill $(cat /tmp/ipv6-lab-ra.pid) 2>/dev/null; "
@@ -747,18 +860,30 @@ class IPv6Lab:
         )
         (self.log.results_dir / f"ra-{mode}.txt").write_text(output + "\n", encoding="utf-8")
         self.log.assertion(f"{mode} RA flags", ra_matches(output, mode), output)
+        self.log.assertion(
+            f"{mode} advertised LAN prefix",
+            ra_prefix_matches(output, lan_prefix, aggregate),
+            output,
+        )
 
     def add_dhcp_client(self, request_kind, mode):
         self.remove_dhcp_clients()
+        values = {
+            "interface": self.args.router_interface,
+            "request": request_kind,
+            "use-peer-dns": "true",
+            "disabled": "false",
+            "comment": f"{TAG}-{mode}",
+        }
+        if request_kind == "prefix":
+            values.update({
+                "pool-name": f"{TAG}-pd",
+                "pool-prefix-length": "64",
+                "prefix-hint": "::/64",
+            })
         self.router.add(
             "ipv6/dhcp-client",
-            {
-                "interface": self.args.router_interface,
-                "request": request_kind,
-                "use-peer-dns": "true",
-                "disabled": "false",
-                "comment": f"{TAG}-{mode}",
-            },
+            values,
         )
 
     def remove_dhcp_clients(self):
@@ -787,10 +912,12 @@ class IPv6Lab:
         return last
 
     def prefix_address(self, prefix):
-        base = prefix.split("::", 1)[0].lower()
         for item in records(self.router.get("ipv6/address")):
-            address = item.get("address", "").lower()
-            if item.get("interface") == self.args.router_interface and address.startswith(base + ":"):
+            address = str(item.get("address", ""))
+            if (
+                item.get("interface") == self.args.router_interface
+                and address_in_prefix(address, prefix)
+            ):
                 return item
         return None
 
@@ -822,6 +949,27 @@ class IPv6Lab:
             if require_address and not address.startswith(base + ":"):
                 continue
             return item
+        return None
+
+    def pd_client_bound(self, aggregate):
+        for item in records(self.router.get("ipv6/dhcp-client")):
+            if item.get("comment") != f"{TAG}-stateless_pd" or item.get("status") != "bound":
+                continue
+            if delegated_prefix_matches(routeros_prefix(item.get("prefix")), aggregate):
+                return item
+        return None
+
+    def pd_pool(self, delegated):
+        for item in records(self.router.get("ipv6/pool")):
+            if item.get("name") != f"{TAG}-pd":
+                continue
+            try:
+                pool = ipaddress.IPv6Network(str(item.get("prefix", "")))
+                lease = ipaddress.IPv6Network(delegated)
+            except ValueError:
+                continue
+            if pool == lease and str(item.get("prefix-length", "64")) == "64":
+                return item
         return None
 
     def dns_has(self, address):
@@ -871,7 +1019,7 @@ class IPv6Lab:
         self.start_ra_capture()
         self.add_dhcp_client(request_kind, mode)
         self.toggle_router_interface()
-        self.finish_ra_capture(mode)
+        self.finish_ra_capture(mode, prefix)
 
         address = self.wait_for(f"{mode} RouterOS address", lambda: self.prefix_address(prefix))
         self.log.assertion(f"{mode} address", bool(address), address)
@@ -909,6 +1057,63 @@ class IPv6Lab:
 
         observation = self.wait_for(f"{mode} OpenWrt client observation", observed_client)
         self.log.assertion(f"{mode} OpenWrt client observation", True, observation)
+        return failures
+
+    def run_pd_mode(self, prefix):
+        failures = []
+        lan_prefix = first_lan_prefix(prefix)
+        router_address = first_router_address(prefix)
+        status = self.board_rpc("apply", {"mode": "stateless_pd", "prefix": prefix})
+        self.log.assertion(
+            "stateless_pd board status",
+            status.get("ok") is True
+            and status.get("mode") == "stateless_pd"
+            and status.get("prefix") == prefix
+            and status.get("lan_prefix") == lan_prefix
+            and status.get("pd_server_enabled") is True,
+            status,
+        )
+        self.start_ra_capture()
+        self.add_dhcp_client("prefix", "stateless_pd")
+        self.toggle_router_interface()
+        self.finish_ra_capture("stateless_pd", lan_prefix, prefix)
+
+        address = self.wait_for(
+            "stateless_pd RouterOS SLAAC address",
+            lambda: self.prefix_address(lan_prefix),
+        )
+        self.log.assertion("stateless_pd address", bool(address), address)
+        dhcp = self.wait_for("stateless_pd IA_PD binding", lambda: self.pd_client_bound(prefix))
+        self.log.assertion("stateless_pd IA_PD binding", True, dhcp)
+        delegated = routeros_prefix(dhcp.get("prefix"))
+        pool = self.wait_for("stateless_pd RouterOS dynamic pool", lambda: self.pd_pool(delegated))
+        self.log.assertion("stateless_pd RouterOS dynamic pool", True, pool)
+
+        def board_delegation():
+            observation = self.board_rpc("get_status")
+            return observation if (
+                str(observation.get("delegated_prefix", "")).lower() == delegated
+                and observation.get("pd_lease_count", 0) >= 1
+                and observation.get("delegated_route_active") is True
+            ) else None
+
+        board_pd = self.wait_for("OpenWrt IA_PD lease and route", board_delegation)
+        self.log.assertion("OpenWrt IA_PD lease and route", True, board_pd)
+        route = self.wait_for("stateless_pd default route", self.default_route)
+        self.log.assertion("stateless_pd default route", bool(route), route)
+        if not self.log.check("stateless_pd local ICMPv6", self.router_ping(router_address), router_address):
+            failures.append("stateless_pd local ICMPv6")
+
+        client_address = str(address.get("address", "")).split("/", 1)[0]
+
+        def observed_client():
+            observation = self.board_rpc("get_status")
+            return observation if client_observation_matches(
+                observation, "stateless_pd", client_address
+            ) else None
+
+        observation = self.wait_for("stateless_pd OpenWrt client observation", observed_client)
+        self.log.assertion("stateless_pd OpenWrt client observation", True, observation)
         return failures
 
     def run_scenarios(self):
@@ -953,6 +1158,7 @@ class IPv6Lab:
         ):
             failures.append("local service survives reject")
 
+        failures.extend(self.run_pd_mode(PD_PREFIX))
         failures.extend(self.run_mode("stateful", STATEFUL_PREFIX, "address"))
         invalid = self.board_rpc("apply", {"mode": "stateless", "prefix": "2001:db8::/64"})
         current = self.board_rpc("get_status")

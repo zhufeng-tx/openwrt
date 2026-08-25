@@ -1,5 +1,7 @@
 #!/bin/sh
 
+# shellcheck disable=SC3043
+
 # shellcheck source=/dev/null
 . /usr/share/libubox/jshn.sh
 # shellcheck source=/dev/null
@@ -9,6 +11,7 @@ APP_CONFIG="ipv6test"
 APP_SECTION="main"
 DEFAULT_MODE="stateless"
 DEFAULT_PREFIX="fd42:6970:7636:1::/64"
+DEFAULT_PD_PREFIX="fd42:6970:7636::/48"
 STATE_DIR="/tmp/ipv6-test-mode"
 LAST_ERROR_FILE="$STATE_DIR/last_error"
 MANAGED_PACKAGES="network dhcp firewall $APP_CONFIG"
@@ -33,7 +36,7 @@ read_last_error() {
 
 validate_mode() {
 	case "$1" in
-	stateless|stateful) return 0 ;;
+	stateless|stateful|stateless_pd) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -46,9 +49,28 @@ validate_prefix() {
 	printf '%s\n' "$1" | grep -Eq '^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){3}::/64$'
 }
 
+validate_pd_prefix() {
+	case "$1" in
+	*/48) printf '%s\n' "$1" | grep -Eq '^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){2}::/48$' ;;
+	*/52) printf '%s\n' "$1" | grep -Eq '^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){2}:[0-9a-f]000::/52$' ;;
+	*/56) printf '%s\n' "$1" | grep -Eq '^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){2}:[0-9a-f]{2}00::/56$' ;;
+	*/60) printf '%s\n' "$1" | grep -Eq '^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){2}:[0-9a-f]{3}0::/60$' ;;
+	*) return 1 ;;
+	esac
+}
+
 derive_addresses() {
 	PREFIX_BASE="${1%::/64}"
 	ROUTER_ADDRESS="${PREFIX_BASE}::1"
+	LAN_PREFIX="$1"
+	ADDRESS_PREFIX_LENGTH=64
+}
+
+derive_pd_addresses() {
+	PREFIX_BASE="${1%::*}"
+	ADDRESS_PREFIX_LENGTH="${1##*/}"
+	ROUTER_ADDRESS="${PREFIX_BASE}::1"
+	LAN_PREFIX="${PREFIX_BASE}::/64"
 }
 
 snapshot_create() {
@@ -86,17 +108,33 @@ ensure_base_sections() {
 }
 
 configure_common() {
-	prefix="$1"
-	derive_addresses "$prefix"
+	mode="$1"
+	prefix="$2"
 
+	uci -q delete network.lan.ip6prefix
 	uci -q delete network.lan.ip6assign
+	uci -q delete network.lan.ip6hint
+	uci -q delete network.lan.ip6ifaceid
+	uci -q delete network.lan.ip6class
 	uci -q delete network.lan.ip6addr
-	uci -q add_list network.lan.ip6addr="$ROUTER_ADDRESS/64" || return 1
+	if [ "$mode" = "stateless_pd" ]; then
+		derive_pd_addresses "$prefix"
+		uci -q add_list network.lan.ip6prefix="$prefix,4294967295,4294967295,class=ipv6test" || return 1
+		uci -q set network.lan.ip6assign="$ADDRESS_PREFIX_LENGTH" || return 1
+		uci -q set network.lan.ip6ifaceid='::1' || return 1
+		uci -q add_list network.lan.ip6class='ipv6test' || return 1
+	else
+		derive_addresses "$prefix"
+		uci -q add_list network.lan.ip6addr="$ROUTER_ADDRESS/64" || return 1
+	fi
 
 	uci -q delete dhcp.lan.ignore
 	uci -q set dhcp.lan.interface='lan' || return 1
 	uci -q set dhcp.lan.dhcpv4='disabled' || return 1
 	uci -q set dhcp.lan.dhcpv6='server' || return 1
+	uci -q set dhcp.lan.dhcpv6_na='0' || return 1
+	uci -q set dhcp.lan.dhcpv6_pd='0' || return 1
+	uci -q delete dhcp.lan.dhcpv6_pd_min_len
 	uci -q set dhcp.lan.ra='server' || return 1
 	uci -q set dhcp.lan.ra_default='1' || return 1
 	uci -q set dhcp.lan.ra_dns='0' || return 1
@@ -128,7 +166,7 @@ configure_enabled() {
 	prefix="$2"
 
 	ensure_base_sections || return 1
-	configure_common "$prefix" || return 1
+	configure_common "$mode" "$prefix" || return 1
 
 	case "$mode" in
 	stateless)
@@ -136,8 +174,14 @@ configure_enabled() {
 		uci -q add_list dhcp.lan.ra_flags='other-config' || return 1
 		;;
 	stateful)
+		uci -q set dhcp.lan.dhcpv6_na='1' || return 1
 		uci -q set dhcp.lan.ra_slaac='0' || return 1
 		uci -q add_list dhcp.lan.ra_flags='managed-config' || return 1
+		;;
+	stateless_pd)
+		uci -q set dhcp.lan.dhcpv6_pd='1' || return 1
+		uci -q set dhcp.lan.ra_slaac='1' || return 1
+		uci -q add_list dhcp.lan.ra_flags='other-config' || return 1
 		;;
 	esac
 
@@ -151,12 +195,19 @@ configure_disabled() {
 	ensure_base_sections || return 1
 
 	uci -q delete network.lan.ip6assign
+	uci -q delete network.lan.ip6hint
+	uci -q delete network.lan.ip6ifaceid
+	uci -q delete network.lan.ip6class
+	uci -q delete network.lan.ip6prefix
 	uci -q delete network.lan.ip6addr
 
 	uci -q delete dhcp.lan.ignore
 	uci -q set dhcp.lan.interface='lan' || return 1
 	uci -q set dhcp.lan.dhcpv4='disabled' || return 1
 	uci -q set dhcp.lan.dhcpv6='disabled' || return 1
+	uci -q set dhcp.lan.dhcpv6_na='0' || return 1
+	uci -q set dhcp.lan.dhcpv6_pd='0' || return 1
+	uci -q delete dhcp.lan.dhcpv6_pd_min_len
 	uci -q set dhcp.lan.ra='disabled' || return 1
 	uci -q set dhcp.lan.ra_slaac='0' || return 1
 	uci -q set dhcp.lan.ra_dns='0' || return 1
@@ -182,10 +233,11 @@ reload_services() {
 		"dnsmasq restart" \
 		"odhcpd restart" \
 		"firewall reload"; do
-		set -- $action
-		service_log="$STATE_DIR/service-$1-$2.log"
-		if ! /etc/init.d/"$1" "$2" >"$service_log" 2>&1; then
-			log_error "$1 $2 failed; see $service_log"
+		service="${action%% *}"
+		verb="${action#* }"
+		service_log="$STATE_DIR/service-$service-$verb.log"
+		if ! /etc/init.d/"$service" "$verb" >"$service_log" 2>&1; then
+			log_error "$service $verb failed; see $service_log"
 			return 1
 		fi
 	done
@@ -229,6 +281,47 @@ bound_dhcpv6_addresses() {
 				json_select "$address_key" >/dev/null 2>&1 || continue
 				json_get_var lease_address address
 				[ -n "$lease_address" ] && printf '%s\n' "$lease_address"
+				json_select ..
+			done
+			json_select ..
+		fi
+		json_select ..
+	done
+}
+
+bound_dhcpv6_prefixes() {
+	local lease_json="$1"
+	local lease_device="$2"
+	local lease_keys lease_key lease_flags prefix_keys prefix_key lease_prefix prefix_length
+	jshn -r "$lease_json" >/dev/null 2>&1 || return 1
+	json_load "$lease_json" >/dev/null 2>&1 || return 1
+	json_select device >/dev/null 2>&1 || return 0
+	json_select "$lease_device" >/dev/null 2>&1 || return 0
+	json_select leases >/dev/null 2>&1 || return 0
+	json_get_keys lease_keys
+
+	for lease_key in $lease_keys; do
+		json_select "$lease_key" >/dev/null 2>&1 || continue
+		lease_flags=""
+		json_get_values lease_flags flags >/dev/null 2>&1 || lease_flags=""
+		case " $lease_flags " in
+		*" bound "*) ;;
+		*)
+			json_select ..
+			continue
+			;;
+		esac
+
+		if json_select ipv6-prefix >/dev/null 2>&1; then
+			json_get_keys prefix_keys
+			for prefix_key in $prefix_keys; do
+				json_select "$prefix_key" >/dev/null 2>&1 || continue
+				lease_prefix=""
+				prefix_length=""
+				json_get_var lease_prefix address
+				json_get_var prefix_length prefix-length
+				[ -n "$lease_prefix" ] && [ -n "$prefix_length" ] && \
+					printf '%s/%s\n' "$lease_prefix" "$prefix_length"
 				json_select ..
 			done
 			json_select ..
@@ -283,7 +376,7 @@ observe_client() {
 		return 0
 	fi
 
-	if [ "$mode" = "stateless" ]; then
+	if [ "$mode" = "stateless" ] || [ "$mode" = "stateless_pd" ]; then
 		client_candidate="$(usable_neighbor "$client_neighbors" "")"
 		[ -n "$client_candidate" ] || return 0
 		client_address="${client_candidate%%|*}"
@@ -323,22 +416,46 @@ status_json() {
 	prefix="$(normalize_prefix "$(uci -q get "$APP_CONFIG.$APP_SECTION.prefix")")"
 	[ "$enabled" = "1" ] || enabled=0
 	validate_mode "$mode" || mode="$DEFAULT_MODE"
-	validate_prefix "$prefix" || prefix="$DEFAULT_PREFIX"
-	derive_addresses "$prefix"
+	if [ "$mode" = "stateless_pd" ]; then
+		validate_pd_prefix "$prefix" || prefix="$DEFAULT_PD_PREFIX"
+		derive_pd_addresses "$prefix"
+	else
+		validate_prefix "$prefix" || prefix="$DEFAULT_PREFIX"
+		derive_addresses "$prefix"
+	fi
 
 	address_active=0
 	odhcpd_running=0
 	dnsmasq_running=0
 	firewall_running=0
 	forwarding_blocked=0
+	pd_server_enabled=0
+	pd_lease_count=0
+	delegated_prefix=""
+	delegated_route_active=0
 
-	ip -6 addr show 2>/dev/null | grep -Fq "inet6 $ROUTER_ADDRESS/64 " && address_active=1
+	ip -6 addr show 2>/dev/null | \
+		grep -Fq "inet6 $ROUTER_ADDRESS/$ADDRESS_PREFIX_LENGTH " && address_active=1
 	service_running odhcpd && odhcpd_running=1
 	service_running dnsmasq && dnsmasq_running=1
 	nft list table inet fw4 >/dev/null 2>&1 && firewall_running=1
 	if [ "$firewall_running" = "1" ] && \
 		nft list table inet fw4 2>/dev/null | grep -Fq 'IPv6 test mode: block forwarded traffic'; then
 		forwarding_blocked=1
+	fi
+	if [ "$mode" = "stateless_pd" ] && \
+		[ "$(uci -q get dhcp.lan.dhcpv6_pd)" = "1" ]; then
+		pd_server_enabled=1
+		if client_device=""; network_get_device client_device lan && [ -n "$client_device" ]; then
+			if client_leases="$(ubus call dhcp ipv6leases 2>/dev/null)"; then
+				delegated_prefixes="$(bound_dhcpv6_prefixes "$client_leases" "$client_device")"
+				delegated_prefix="$(printf '%s\n' "$delegated_prefixes" | sed '/^$/d' | LC_ALL=C sort | sed -n '1p')"
+				pd_lease_count="$(printf '%s\n' "$delegated_prefixes" | sed '/^$/d' | wc -l | tr -d ' ')"
+				[ -n "$delegated_prefix" ] && \
+					ip -6 route show 2>/dev/null | grep -Fq "$delegated_prefix " && \
+					delegated_route_active=1
+			fi
+		fi
 	fi
 
 	if [ "$enabled" = "1" ] && [ "$address_active" = "1" ] && \
@@ -366,6 +483,7 @@ status_json() {
 	json_add_string mode "$mode"
 	json_add_string active_mode "$active_mode"
 	json_add_string prefix "$prefix"
+	json_add_string lan_prefix "$LAN_PREFIX"
 	json_add_string router_address "$ROUTER_ADDRESS"
 	json_add_string dns_address "$ROUTER_ADDRESS"
 	json_add_string dns_name "router.ipv6.test"
@@ -376,6 +494,10 @@ status_json() {
 	json_add_boolean dnsmasq_running "$dnsmasq_running"
 	json_add_boolean firewall_running "$firewall_running"
 	json_add_boolean forwarding_blocked "$forwarding_blocked"
+	json_add_boolean pd_server_enabled "$pd_server_enabled"
+	json_add_int pd_lease_count "$pd_lease_count"
+	json_add_string delegated_prefix "$delegated_prefix"
+	json_add_boolean delegated_route_active "$delegated_route_active"
 	json_add_string client_state "$client_state"
 	json_add_boolean client_observed "$client_observed"
 	json_add_string client_address "$client_address"
@@ -394,11 +516,15 @@ apply_enabled() {
 	do_reload="$3"
 
 	if ! validate_mode "$mode"; then
-		set_last_error "Mode must be stateless or stateful."
+		set_last_error "Mode must be stateless, stateful, or stateless_pd."
 		status_json
 		return 1
 	fi
-	if ! validate_prefix "$prefix"; then
+	if [ "$mode" = "stateless_pd" ] && ! validate_pd_prefix "$prefix"; then
+		set_last_error "Delegation prefix must be a normalized, nibble-aligned ULA /48, /52, /56, or /60."
+		status_json
+		return 1
+	elif [ "$mode" != "stateless_pd" ] && ! validate_prefix "$prefix"; then
 		set_last_error "Prefix must use normalized ULA /64 form: fdxx:xxxx:xxxx:xxxx::/64."
 		status_json
 		return 1
@@ -490,7 +616,7 @@ status)
 	status_json
 	;;
 *)
-	echo "Usage: $0 {apply <stateless|stateful> <ula-prefix/64>|disable|seed|boot|status}" >&2
+	echo "Usage: $0 {apply <stateless|stateful> <ula-prefix/64>|apply stateless_pd <ula-prefix/48|52|56|60>|disable|seed|boot|status}" >&2
 	exit 2
 	;;
 esac
