@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=Isolated IPv6 Test Mode
-LUCI_DESCRIPTION:=Configure an offline LAN for stateless, stateful, and DHCPv6-PD testing
+LUCI_DESCRIPTION:=Configure an offline LAN for SLAAC-only, stateful, and DHCPv6-PD testing
 LUCI_DEPENDS:=+luci-light +odhcpd-ipv6only +dnsmasq +firewall4
 LUCI_PKGARCH:=all
 

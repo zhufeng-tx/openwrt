@@ -104,9 +104,10 @@ enables test mode, and it isolates `ether2` first.
 
 ## Acceptance scenarios
 
-The harness exercises first-boot service health, stateless RA plus DHCPv6
-information, stateful DHCPv6 IA_NA, and stateless LAN addressing combined with
-DHCPv6 IA_PD. The PD scenario verifies RouterOS binding to a distinct /64,
+The harness exercises first-boot service health, SLAAC-only RA with RDNSS,
+zero DHCPv6 server replies to an IA_NA request, stateful DHCPv6 IA_NA, and
+stateless LAN addressing combined with DHCPv6 IA_PD. The PD scenario verifies
+RouterOS binding to a distinct /64,
 odhcpd lease visibility, and the installed downstream route. It also covers
 local DNS (`router.ipv6.test`), ICMPv6, actual forwarding-rule counter growth,
 invalid-prefix rollback, disable, and the selected final state. The normal
@@ -117,6 +118,10 @@ The connected RouterOS router proves delegation, dynamic pool creation, and
 the devboard route. End-to-end SLAAC and traffic from a client behind RouterOS
 still require a separately identified, isolated downstream interface and a
 real downstream client.
+
+SLAAC-only mode sets the explicit odhcpd `ra_flags=none` value. Omitting the
+option would restore odhcpd's default `other-config` flag and re-enable the RA
+O bit even while the DHCPv6 server itself is disabled.
 
 Run host-side tests with:
 

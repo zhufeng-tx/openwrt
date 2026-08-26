@@ -33,12 +33,15 @@ var DEFAULT_STATUS = {
 	router_address: 'fd42:6970:7636:1::1',
 	dns_address: 'fd42:6970:7636:1::1',
 	dns_name: 'router.ipv6.test',
-	ra_flags: 'A=1 O=1 M=0',
+	ra_flags: 'A=1 O=0 M=0',
 	address_active: false,
 	odhcpd_running: false,
 	dnsmasq_running: false,
 	forwarding_blocked: false,
+	dhcpv6_server_enabled: false,
+	dhcpv6_na_enabled: false,
 	pd_server_enabled: false,
+	mode_configuration_ok: false,
 	pd_lease_count: 0,
 	delegated_prefix: '',
 	delegated_route_active: false,
@@ -181,6 +184,7 @@ return view.extend({
 	renderStatus: function() {
 		var status = this.status;
 		var pdMode = status.mode === 'stateless_pd';
+		var slaacOnly = status.mode === 'stateless';
 		var activeLabel = status.enabled
 			? (status.active_mode === 'degraded' ? _('Degraded') : pdMode ? _('Stateless + PD') : status.mode === 'stateful' ? _('Stateful') : _('Stateless'))
 			: _('Disabled');
@@ -214,6 +218,11 @@ return view.extend({
 			E('div', { 'class': 'v6lab-checks' }, [
 				this.statusChip(_('LAN address'), status.address_active, !status.enabled),
 				this.statusChip(_('odhcpd'), status.odhcpd_running, !status.enabled),
+				slaacOnly ? this.statusChip(
+					_('DHCPv6 disabled'),
+					!status.dhcpv6_server_enabled && !status.dhcpv6_na_enabled,
+					!status.enabled
+				) : '',
 				pdMode ? this.statusChip(_('PD server'), status.pd_server_enabled, !status.enabled) : '',
 				this.statusChip(_('Local DNS'), status.dnsmasq_running, !status.enabled),
 				this.statusChip(_('Forwarding blocked'), status.forwarding_blocked, !status.enabled)
@@ -275,7 +284,9 @@ return view.extend({
 		if (mode !== 'stateless_pd')
 			return E('div', { 'class': 'v6lab-flow', 'aria-label': _('Router Advertisement flow') }, [
 				E('span', {}, [ _('Router') ]),
-				E('span', { 'class': 'v6lab-arrow', 'aria-hidden': 'true' }, [ '── RA + DHCPv6 ──▶' ]),
+				E('span', { 'class': 'v6lab-arrow', 'aria-hidden': 'true' }, [
+					mode === 'stateless' ? '── RA only ──▶' : '── RA + DHCPv6 ──▶'
+				]),
 				E('span', {}, [ _('Test client') ])
 			]);
 		return E('div', { 'class': 'v6lab-flow is-pd', 'aria-label': _('Prefix delegation flow') }, [
@@ -429,9 +440,9 @@ return view.extend({
 			poll.add(this.pollFn, 5);
 		}
 		var statelessCard = this.modeCard(
-			'stateless', _('Stateless'), 'A=1  O=1  M=0',
+			'stateless', _('Stateless'), 'A=1  O=0  M=0',
 			_('The client creates its address with SLAAC.'),
-			_('Local DNS arrives through stateless DHCPv6.')
+			_('Local DNS arrives through Router Advertisement RDNSS; DHCPv6 is disabled.')
 		);
 		var statefulCard = this.modeCard(
 			'stateful', _('Stateful'), 'A=0  O=0  M=1',

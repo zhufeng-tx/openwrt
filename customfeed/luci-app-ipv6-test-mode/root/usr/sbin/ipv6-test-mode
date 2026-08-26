@@ -170,8 +170,10 @@ configure_enabled() {
 
 	case "$mode" in
 	stateless)
+		uci -q set dhcp.lan.dhcpv6='disabled' || return 1
 		uci -q set dhcp.lan.ra_slaac='1' || return 1
-		uci -q add_list dhcp.lan.ra_flags='other-config' || return 1
+		uci -q set dhcp.lan.ra_dns='1' || return 1
+		uci -q add_list dhcp.lan.ra_flags='none' || return 1
 		;;
 	stateful)
 		uci -q set dhcp.lan.dhcpv6_na='1' || return 1
@@ -429,7 +431,10 @@ status_json() {
 	dnsmasq_running=0
 	firewall_running=0
 	forwarding_blocked=0
+	dhcpv6_server_enabled=0
+	dhcpv6_na_enabled=0
 	pd_server_enabled=0
+	mode_configuration_ok=0
 	pd_lease_count=0
 	delegated_prefix=""
 	delegated_route_active=0
@@ -443,7 +448,12 @@ status_json() {
 		nft list table inet fw4 2>/dev/null | grep -Fq 'IPv6 test mode: block forwarded traffic'; then
 		forwarding_blocked=1
 	fi
+	[ "$(uci -q get dhcp.lan.dhcpv6)" = "server" ] && dhcpv6_server_enabled=1
+	if [ "$(uci -q get dhcp.lan.dhcpv6_na)" = "1" ]; then
+		dhcpv6_na_enabled=1
+	fi
 	if [ "$mode" = "stateless_pd" ] && \
+		[ "$dhcpv6_server_enabled" = "1" ] && \
 		[ "$(uci -q get dhcp.lan.dhcpv6_pd)" = "1" ]; then
 		pd_server_enabled=1
 		if client_device=""; network_get_device client_device lan && [ -n "$client_device" ]; then
@@ -458,9 +468,37 @@ status_json() {
 		fi
 	fi
 
+	case "$mode" in
+	stateless)
+		if [ "$dhcpv6_server_enabled" = "0" ] && [ "$dhcpv6_na_enabled" = "0" ] && \
+			[ "$(uci -q get dhcp.lan.dhcpv6_pd)" = "0" ] && \
+			[ "$(uci -q get dhcp.lan.ra_slaac)" = "1" ] && \
+			[ "$(uci -q get dhcp.lan.ra_dns)" = "1" ] && \
+			[ "$(uci -q get dhcp.lan.ra_flags)" = "none" ]; then
+			mode_configuration_ok=1
+		fi
+		;;
+	stateful)
+		if [ "$dhcpv6_server_enabled" = "1" ] && [ "$dhcpv6_na_enabled" = "1" ] && \
+			[ "$(uci -q get dhcp.lan.dhcpv6_pd)" = "0" ] && \
+			[ "$(uci -q get dhcp.lan.ra_slaac)" = "0" ] && \
+			[ "$(uci -q get dhcp.lan.ra_flags)" = "managed-config" ]; then
+			mode_configuration_ok=1
+		fi
+		;;
+	stateless_pd)
+		if [ "$dhcpv6_server_enabled" = "1" ] && [ "$dhcpv6_na_enabled" = "0" ] && \
+			[ "$pd_server_enabled" = "1" ] && \
+			[ "$(uci -q get dhcp.lan.ra_slaac)" = "1" ] && \
+			[ "$(uci -q get dhcp.lan.ra_flags)" = "other-config" ]; then
+			mode_configuration_ok=1
+		fi
+		;;
+	esac
+
 	if [ "$enabled" = "1" ] && [ "$address_active" = "1" ] && \
 		[ "$odhcpd_running" = "1" ] && [ "$dnsmasq_running" = "1" ] && \
-		[ "$forwarding_blocked" = "1" ]; then
+		[ "$forwarding_blocked" = "1" ] && [ "$mode_configuration_ok" = "1" ]; then
 		ok=1
 		active_mode="$mode"
 	elif [ "$enabled" = "0" ]; then
@@ -473,7 +511,8 @@ status_json() {
 
 	case "$mode" in
 	stateful) ra_flags="A=0 O=0 M=1" ;;
-	*) ra_flags="A=1 O=1 M=0" ;;
+	stateless_pd) ra_flags="A=1 O=1 M=0" ;;
+	*) ra_flags="A=1 O=0 M=0" ;;
 	esac
 	observe_client
 
@@ -494,7 +533,10 @@ status_json() {
 	json_add_boolean dnsmasq_running "$dnsmasq_running"
 	json_add_boolean firewall_running "$firewall_running"
 	json_add_boolean forwarding_blocked "$forwarding_blocked"
+	json_add_boolean dhcpv6_server_enabled "$dhcpv6_server_enabled"
+	json_add_boolean dhcpv6_na_enabled "$dhcpv6_na_enabled"
 	json_add_boolean pd_server_enabled "$pd_server_enabled"
+	json_add_boolean mode_configuration_ok "$mode_configuration_ok"
 	json_add_int pd_lease_count "$pd_lease_count"
 	json_add_string delegated_prefix "$delegated_prefix"
 	json_add_boolean delegated_route_active "$delegated_route_active"

@@ -123,6 +123,13 @@ def parse_firewall_packets(text):
     return int(match.group(1))
 
 
+def parse_capture_packets(text):
+    match = re.search(r"\b(\d+)\s+packets? captured\b", text)
+    if not match:
+        raise LabError(f"packet capture summary not found: {text.strip()}")
+    return int(match.group(1))
+
+
 def client_observation_matches(status, mode, address):
     expected_method = "dhcpv6" if mode == "stateful" else "slaac"
     return (
@@ -142,9 +149,23 @@ def ra_matches(text, mode):
     managed = "managed" in lowered
     other = "other stateful" in lowered or "other-config" in lowered
     autonomous = bool(re.search(r"\bauto(?:nomous)?\b", lowered))
-    if mode in ("stateless", "stateless_pd"):
+    if mode == "stateless":
+        return not managed and not other and autonomous
+    if mode == "stateless_pd":
         return not managed and other and autonomous
     return managed and not other and not autonomous
+
+
+def ra_rdnss_matches(text, address):
+    advertised = re.findall(
+        r"rdnss option[^\r\n]*?addr:\s*([0-9a-f:]+)", text.lower()
+    )
+    try:
+        normalized = {str(ipaddress.IPv6Address(item)) for item in advertised}
+        expected = str(ipaddress.IPv6Address(address))
+    except ValueError:
+        return False
+    return normalized == {expected}
 
 
 def first_lan_prefix(prefix):
@@ -380,6 +401,10 @@ class SerialConsole:
     def send_line(self, line):
         os.write(self.fd, line.encode() + b"\r")
 
+    def interrupt(self, timeout=5):
+        os.write(self.fd, b"\x03\r")
+        return self.read_until(PROMPT_RE, timeout)
+
     def read_until(self, pattern, timeout):
         deadline = time.monotonic() + timeout
         data = bytearray()
@@ -437,6 +462,11 @@ class SerialConsole:
             raw += self.read_until(PROMPT_RE, 30)
         if not PROMPT_RE.search(raw):
             raise LabError("board did not return to a root prompt after sysupgrade")
+        # The first prompt appears before late module loading and entropy setup
+        # finish. Long commands sent in that window can be truncated by UART
+        # input overruns, leaving ash at its continuation prompt.
+        time.sleep(12)
+        raw += self.interrupt()
         text = raw.decode("utf-8", "replace")
         failure = sysupgrade_failure(text)
         if failure:
@@ -765,12 +795,18 @@ class IPv6Lab:
         deadline = time.monotonic() + timeout
         last = ""
         while time.monotonic() < deadline:
-            output, rc = self.serial.command(
-                "test -x /usr/sbin/ipv6-test-mode && "
-                "ubus list luci.ipv6_test 2>/dev/null && "
-                "/usr/sbin/ipv6-test-mode status",
-                timeout=15,
-            )
+            try:
+                output, rc = self.serial.command(
+                    "test -x /usr/sbin/ipv6-test-mode && "
+                    "ubus list luci.ipv6_test 2>/dev/null && "
+                    "/usr/sbin/ipv6-test-mode status",
+                    timeout=15,
+                )
+            except LabError as exc:
+                last = str(exc)
+                self.serial.interrupt()
+                time.sleep(2)
+                continue
             last = output
             try:
                 status = extract_json(output)
@@ -865,6 +901,36 @@ class IPv6Lab:
             ra_prefix_matches(output, lan_prefix, aggregate),
             output,
         )
+        if mode == "stateless":
+            self.log.assertion(
+                "stateless RDNSS",
+                ra_rdnss_matches(output, first_router_address(lan_prefix)),
+                output,
+            )
+
+    def start_dhcpv6_reply_capture(self):
+        command = (
+            "rm -f /tmp/ipv6-lab-dhcpv6.txt /tmp/ipv6-lab-dhcpv6.pid; "
+            "tcpdump -lnvv -c 1 -i br-lan 'udp src port 547 and dst port 546' "
+            ">/tmp/ipv6-lab-dhcpv6.txt 2>&1 & echo $! >/tmp/ipv6-lab-dhcpv6.pid"
+        )
+        output, rc = self.serial.command(command)
+        if rc:
+            raise LabError(f"could not start DHCPv6 reply capture: {output}")
+
+    def finish_dhcpv6_reply_capture(self, mode):
+        output, _ = self.serial.command(
+            "test ! -s /tmp/ipv6-lab-dhcpv6.pid || "
+            "kill $(cat /tmp/ipv6-lab-dhcpv6.pid) 2>/dev/null; "
+            "for delay in 1 2 3 4 5; do "
+            "grep -Eq '[0-9]+ packets? captured' /tmp/ipv6-lab-dhcpv6.txt && break; "
+            "sleep 1; done; "
+            "cat /tmp/ipv6-lab-dhcpv6.txt",
+        )
+        (self.log.results_dir / f"dhcpv6-{mode}.txt").write_text(
+            output + "\n", encoding="utf-8"
+        )
+        return parse_capture_packets(output)
 
     def add_dhcp_client(self, request_kind, mode):
         self.remove_dhcp_clients()
@@ -1017,19 +1083,46 @@ class IPv6Lab:
         status = self.board_rpc("apply", {"mode": mode, "prefix": prefix})
         self.log.assertion(f"{mode} board status", status.get("ok") is True, status)
         self.start_ra_capture()
-        self.add_dhcp_client(request_kind, mode)
-        self.toggle_router_interface()
-        self.finish_ra_capture(mode, prefix)
+        replies = None
+        dhcp_capture_started = False
+        try:
+            if mode == "stateless":
+                self.start_dhcpv6_reply_capture()
+                dhcp_capture_started = True
+            self.add_dhcp_client(request_kind, mode)
+            self.toggle_router_interface()
+            self.finish_ra_capture(mode, prefix)
+            address = self.wait_for(
+                f"{mode} RouterOS address", lambda: self.prefix_address(prefix)
+            )
+            self.log.assertion(f"{mode} address", bool(address), address)
+            dhcp = self.poll_for(
+                lambda: self.dhcp_client_bound(mode, prefix, require_address=True),
+            )
+        finally:
+            if dhcp_capture_started:
+                replies = self.finish_dhcpv6_reply_capture(mode)
 
-        address = self.wait_for(f"{mode} RouterOS address", lambda: self.prefix_address(prefix))
-        self.log.assertion(f"{mode} address", bool(address), address)
-        dhcp = self.poll_for(
-            lambda: self.dhcp_client_bound(mode, prefix, require_address=(mode == "stateful")),
+        if mode == "stateless" and not self.log.check(
+            "stateless DHCPv6 server silent",
+            replies == 0,
+            f"{replies} replies",
+        ):
+            failures.append("stateless DHCPv6 server silent")
+        dhcp_evidence = dhcp or self.matching(
+            "ipv6/dhcp-client", "comment", f"{TAG}-{mode}"
         )
-        if not self.log.check(
+        if mode == "stateless":
+            if not self.log.check(
+                "stateless IA_NA unavailable",
+                dhcp is None,
+                dhcp_evidence,
+            ):
+                failures.append("stateless IA_NA unavailable")
+        elif not self.log.check(
             f"{mode} DHCPv6 binding",
             bool(dhcp),
-            dhcp or self.matching("ipv6/dhcp-client", "comment", f"{TAG}-{mode}"),
+            dhcp_evidence,
         ):
             failures.append(f"{mode} DHCPv6 binding")
         route = self.wait_for(f"{mode} default route", self.default_route)
@@ -1134,12 +1227,20 @@ class IPv6Lab:
             all(first.get(key) is True for key in (
                 "ok", "enabled", "address_active", "odhcpd_running",
                 "dnsmasq_running", "firewall_running", "forwarding_blocked",
+                "mode_configuration_ok",
             )),
+            first,
+        )
+        self.log.assertion(
+            "first-boot SLAAC-only configuration",
+            first.get("dhcpv6_server_enabled") is False
+            and first.get("dhcpv6_na_enabled") is False
+            and first.get("ra_flags") == "A=1 O=0 M=0",
             first,
         )
         self.log.assertion("first-boot prefix", first.get("prefix") == DEFAULT_PREFIX, first)
 
-        failures.extend(self.run_mode("stateless", DEFAULT_PREFIX, "info"))
+        failures.extend(self.run_mode("stateless", DEFAULT_PREFIX, "address"))
         output, rc = self.serial.command("ip -6 route replace 2001:db8::/64 dev br-lan")
         self.log.assertion("forwarding test route", rc == 0, output)
         try:

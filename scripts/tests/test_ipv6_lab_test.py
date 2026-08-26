@@ -34,6 +34,10 @@ class ParserTests(unittest.TestCase):
     def test_firewall_counter(self):
         self.assertEqual(42, LAB.parse_firewall_packets("counter packets 42 bytes 3528 comment test"))
 
+    def test_packet_capture_count(self):
+        self.assertEqual(0, LAB.parse_capture_packets("0 packets captured\n3 packets received by filter"))
+        self.assertEqual(1, LAB.parse_capture_packets("1 packet captured\n1 packet received by filter"))
+
     def test_client_observation_matches_each_assignment_mode(self):
         address = "fd42:6970:7636:1::1234"
         stateless = {
@@ -72,13 +76,24 @@ class ParserTests(unittest.TestCase):
         self.assertEqual("*A", LAB.place_before_first([{".id": "*A"}]))
 
     def test_ra_mode_matching(self):
-        stateless = "router advertisement, Flags [other stateful], prefix option Flags [onlink, auto]"
+        stateless = "router advertisement, Flags [none], prefix option Flags [onlink, auto]"
+        stateless_pd = "router advertisement, Flags [other stateful], prefix option Flags [onlink, auto]"
         stateful = "router advertisement, Flags [managed], prefix option Flags [onlink]"
         self.assertTrue(LAB.ra_matches(stateless, "stateless"))
         self.assertFalse(LAB.ra_matches(stateless, "stateful"))
+        self.assertFalse(LAB.ra_matches(stateless_pd, "stateless"))
         self.assertTrue(LAB.ra_matches(stateful, "stateful"))
         self.assertFalse(LAB.ra_matches(stateful, "stateless"))
-        self.assertTrue(LAB.ra_matches(stateless, "stateless_pd"))
+        self.assertTrue(LAB.ra_matches(stateless_pd, "stateless_pd"))
+
+    def test_stateless_ra_rdnss_matches_exact_router_address(self):
+        capture = (
+            "router advertisement, Flags [none]\n"
+            "rdnss option (25): lifetime 1800s, addr: fd42:6970:7636:1::1"
+        )
+        self.assertTrue(LAB.ra_rdnss_matches(capture, "fd42:6970:7636:1::1"))
+        self.assertFalse(LAB.ra_rdnss_matches(capture, "fd42:6970:7636:1::2"))
+        self.assertFalse(LAB.ra_rdnss_matches("router advertisement", "fd42:6970:7636:1::1"))
 
     def test_prefix_delegation_layout_reserves_first_lan_64(self):
         self.assertEqual("fd42:6970:7636::/64", LAB.first_lan_prefix(LAB.PD_PREFIX))
@@ -327,6 +342,10 @@ class SerialCommands:
         self.commands.append((command, timeout))
         return next(self.responses)
 
+    def interrupt(self, timeout=5):
+        self.commands.append(("<interrupt>", timeout))
+        return b"root@OpenWrt:/# "
+
 
 class RestorationTests(unittest.TestCase):
     def test_nonfatal_check_records_failure_without_raising(self):
@@ -379,7 +398,7 @@ class RestorationTests(unittest.TestCase):
             self.assertEqual("preflight_failed", summary["status"])
             self.assertEqual("offline", summary["error"])
 
-    def test_stateless_information_client_accepts_routeros_idle_status(self):
+    def test_stateless_address_client_is_not_treated_as_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(
                 results_dir=directory,
@@ -393,12 +412,35 @@ class RestorationTests(unittest.TestCase):
                 {
                     ".id": "*d",
                     "comment": LAB.TAG + "-stateless",
-                    "status": "idle",
-                    "request": "info",
+                    "status": "searching...",
+                    "request": "address",
                 }
             ]
             lab.router = fake
-            self.assertIsNotNone(lab.dhcp_client_bound("stateless", LAB.DEFAULT_PREFIX, False))
+            self.assertIsNone(lab.dhcp_client_bound("stateless", LAB.DEFAULT_PREFIX, True))
+
+    def test_stateless_capture_is_stopped_when_setup_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                results_dir=directory,
+                router_url="http://127.0.0.1",
+                router_user="admin",
+                router_interface="ether2",
+            )
+            lab = LAB.IPv6Lab(args, "secret")
+            stopped = []
+            lab.board_rpc = lambda *_args, **_kwargs: {"ok": True}
+            lab.start_ra_capture = lambda: None
+            lab.start_dhcpv6_reply_capture = lambda: None
+            lab.finish_dhcpv6_reply_capture = lambda mode: stopped.append(mode) or 0
+
+            def fail_setup(*_args, **_kwargs):
+                raise LAB.LabError("setup failed")
+
+            lab.add_dhcp_client = fail_setup
+            with self.assertRaises(LAB.LabError):
+                lab.run_mode("stateless", LAB.DEFAULT_PREFIX, "address")
+            self.assertEqual(["stateless"], stopped)
 
     def test_pd_pool_matches_the_bound_delegation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -446,6 +488,31 @@ class RestorationTests(unittest.TestCase):
             lab = LAB.IPv6Lab(args, "secret")
             lab.serial = SerialCommands([('luci.ipv6_test\n{"ok":true}', 0)])
             self.assertIn("luci.ipv6_test", lab.wait_board_image_ready(timeout=1))
+
+    def test_board_image_readiness_recovers_one_lost_serial_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                results_dir=directory,
+                router_url="http://127.0.0.1",
+                router_user="admin",
+                router_interface="ether2",
+            )
+            lab = LAB.IPv6Lab(args, "secret")
+
+            class RecoveringSerial(SerialCommands):
+                def command(self, command, timeout=30):
+                    self.commands.append((command, timeout))
+                    response = next(self.responses)
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+
+            lab.serial = RecoveringSerial([
+                LAB.LabError("lost framing"),
+                ('luci.ipv6_test\\n{"ok":true}', 0),
+            ])
+            self.assertIn("luci.ipv6_test", lab.wait_board_image_ready(timeout=5))
+            self.assertIn(("<interrupt>", 5), lab.serial.commands)
 
     def test_ping_requires_echo_reply_not_icmp_error(self):
         with tempfile.TemporaryDirectory() as directory:
