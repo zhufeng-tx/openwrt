@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "mt7628an.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	compatible = "devboard,mt7628-rpi-header-8m-64m", "mediatek,mt7628an-soc";
+	model = "DevBoard MT7628 RPi Header (8M Flash / 64M RAM)";
+
+	chosen {
+		bootargs = "console=ttyS0,57600";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x4000000>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		ethernet-yellow {
+			label = "yellow:ethernet";
+			gpios = <&gpio 42 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+};
+
+&esw {
+	mediatek,portdisable = <0x1e>;
+};
+
+&gpio {
+	gpio-line-names =
+		"J5_PIN38_I2S_DIN",
+		"J5_PIN40_I2S_DOUT",
+		"J5_PIN35_I2S_WS",
+		"J5_PIN12_I2S_CLK",
+		"J5_PIN5_I2C_SCL",
+		"J5_PIN3_I2C_SDA",
+		"J5_PIN24_SPI_CE0_N",
+		"J5_PIN23_SPI_CLK",
+		"J5_PIN19_SPI_MOSI",
+		"J5_PIN21_SPI_MISO",
+		"",
+		"J5_PIN7_HAT_GPIO4",
+		"",
+		"",
+		"J5_PIN32_HAT_PWM0",
+		"J5_PIN33_HAT_PWM1",
+		"J5_PIN36_HAT_GPIO16",
+		"J5_PIN11_HAT_GPIO17",
+		"J5_PIN29_HAT_GPIO5",
+		"J5_PIN31_HAT_GPIO6",
+		"",
+		"",
+		"",
+		"",
+		"J5_PIN22_SDIO_D1",
+		"J5_PIN18_SDIO_D0",
+		"J5_PIN15_SDIO_CLK",
+		"J5_PIN37_SDIO_D2",
+		"J5_PIN16_SDIO_CMD",
+		"J5_PIN13_SDIO_D3",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"J5_PIN26_CUSTOM_GPIO",
+		"J5_PIN27_CUSTOM_GPIO",
+		"J5_PIN28_CUSTOM_GPIO",
+		"ETHERNET_YELLOW_LED",
+		"",
+		"",
+		"J5_PIN8_UART1_TX",
+		"J5_PIN10_UART1_RX";
+};
+
+&state_default {
+	header_gpio {
+		groups = "gpio", "spis", "pwm0", "pwm1",
+			 "p4led_an", "p3led_an", "p2led_an", "p1led_an";
+		function = "gpio";
+	};
+};
+
+&spi0 {
+	status = "okay";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi_pins>, <&spi_cs1_pins>;
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x0 0x30000>;
+				read-only;
+			};
+
+			partition@30000 {
+				label = "u-boot-env";
+				reg = <0x30000 0x10000>;
+				read-only;
+			};
+
+			factory: partition@40000 {
+				label = "factory";
+				reg = <0x40000 0x10000>;
+				read-only;
+			};
+
+			partition@50000 {
+				compatible = "denx,uimage";
+				label = "firmware";
+				reg = <0x50000 0x7b0000>;
+			};
+		};
+	};
+
+	spidev@1 {
+		compatible = "rohm,dh2228fv";
+		reg = <1>;
+		spi-max-frequency = <40000000>;
+	};
+};
+
+&i2c {
+	status = "okay";
+};
+
+&gdma {
+	status = "okay";
+};
+
+&i2s {
+	status = "okay";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2s_pins>;
+};
+
+&uart1 {
+	status = "okay";
+};
+
+&ethernet {
+	nvmem-cells = <&macaddr_factory_28>;
+	nvmem-cell-names = "mac-address";
+};
+
+&sdhci {
+	status = "okay";
+};
+
+&wmac {
+	status = "okay";
+
+	mediatek,mtd-eeprom = <&factory 0x0>;
+};
+
+&factory {
+	compatible = "nvmem-cells";
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	macaddr_factory_28: macaddr@28 {
+		reg = <0x28 0x6>;
+	};
+};

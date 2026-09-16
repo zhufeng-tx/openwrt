@@ -37,3 +37,15 @@ define Device/devboard_wifi-test-board-hiwooya-16m-ipv6-test
 	luci-app-ipv6-test-mode -wltp -openwrt-mcpd -hgpriv
 endef
 TARGET_DEVICES += devboard_wifi-test-board-hiwooya-16m-ipv6-test
+
+define Device/devboard_mt7628-rpi-header-8m-64m
+  DEVICE_VENDOR := DevBoard
+  DEVICE_MODEL := MT7628 RPi Header
+  DEVICE_VARIANT := 8M Flash / 64M RAM
+  IMAGE_SIZE := 7872k
+  SUPPORTED_DEVICES := devboard,mt7628-rpi-header-8m-64m
+  DEVICE_PACKAGES := -dropbear -ppp -ppp-mod-pppoe kmod-i2c-mt7628 \
+	kmod-sdhci-mt7620 kmod-spi-dev kmod-usb-core kmod-usb2 \
+	gpiod-tools i2c-tools iperf iperf3
+endef
+TARGET_DEVICES += devboard_mt7628-rpi-header-8m-64m
