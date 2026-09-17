@@ -49,3 +49,13 @@ define Device/devboard_mt7628-rpi-header-8m-64m
 	gpiod-tools i2c-tools iperf iperf3
 endef
 TARGET_DEVICES += devboard_mt7628-rpi-header-8m-64m
+
+define Device/devboard_mt7628-remote-tester-8m-64m
+  $(Device/devboard_mt7628-rpi-header-8m-64m)
+  DEVICE_MODEL := MT7628 Remote Tester
+  DEVICE_VARIANT := 8M Flash / 64M RAM
+  DEVICE_DTS := mt7628an_devboard_mt7628-remote-tester-8m-64m
+  SUPPORTED_DEVICES := devboard,mt7628-remote-tester-8m-64m
+  DEVICE_PACKAGES += remote-tester-radio
+endef
+TARGET_DEVICES += devboard_mt7628-remote-tester-8m-64m

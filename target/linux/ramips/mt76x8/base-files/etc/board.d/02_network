@@ -9,6 +9,7 @@ ramips_setup_interfaces()
 
 	case $board in
 	devboard,mt7628-rpi-header-8m-64m|\
+	devboard,mt7628-remote-tester-8m-64m|\
 	devboard,wifi-test-board-8m|\
 	devboard,wifi-test-board-hiwooya-16m)
 		ucidef_add_switch "switch0"

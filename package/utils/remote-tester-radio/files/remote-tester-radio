@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+method="${1:-status}"
+shift || true
+
+is_uint() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+case "$method" in
+	status|probe)
+		[ "$#" -eq 0 ] || exit 2
+		json='{}'
+		;;
+	scan)
+		[ "$#" -eq 3 ] || exit 2
+		is_uint "$1" && is_uint "$2" && is_uint "$3" || exit 2
+		json="{\"start_mhz\":$1,\"end_mhz\":$2,\"dwell_ms\":$3}"
+		;;
+	receive)
+		[ "$#" -eq 1 ] || exit 2
+		is_uint "$1" || exit 2
+		json="{\"timeout_ms\":$1}"
+		;;
+	tx_test)
+		[ "${1:-}" = '--antenna-confirmed' ] && [ "$#" -eq 1 ] || exit 2
+		json='{"antenna_confirmed":true}'
+		;;
+	*)
+		echo "usage: remote-tester-radioctl {status|probe|scan START_MHZ END_MHZ DWELL_MS|receive TIMEOUT_MS|tx_test --antenna-confirmed}" >&2
+		exit 2
+		;;
+esac
+exec ubus -t 65 call remote_tester.radio "$method" "$json"

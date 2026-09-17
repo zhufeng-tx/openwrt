@@ -1,21 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 
-#include "mt7628an.dtsi"
+#include "mt7628an_devboard_mt7628-8m-64m.dtsi"
 
 #include <dt-bindings/gpio/gpio.h>
 
 / {
 	compatible = "devboard,mt7628-rpi-header-8m-64m", "mediatek,mt7628an-soc";
 	model = "DevBoard MT7628 RPi Header (8M Flash / 64M RAM)";
-
-	chosen {
-		bootargs = "console=ttyS0,57600";
-	};
-
-	memory@0 {
-		device_type = "memory";
-		reg = <0x0 0x4000000>;
-	};
 
 	leds {
 		compatible = "gpio-leds";
@@ -26,10 +17,6 @@
 			default-state = "off";
 		};
 	};
-};
-
-&esw {
-	mediatek,portdisable = <0x1e>;
 };
 
 &gpio {
@@ -81,105 +68,4 @@
 		"",
 		"J5_PIN8_UART1_TX",
 		"J5_PIN10_UART1_RX";
-};
-
-&state_default {
-	header_gpio {
-		groups = "gpio", "spis", "pwm0", "pwm1",
-			 "p4led_an", "p3led_an", "p2led_an", "p1led_an";
-		function = "gpio";
-	};
-};
-
-&spi0 {
-	status = "okay";
-
-	pinctrl-names = "default";
-	pinctrl-0 = <&spi_pins>, <&spi_cs1_pins>;
-
-	flash@0 {
-		compatible = "jedec,spi-nor";
-		reg = <0>;
-		spi-max-frequency = <40000000>;
-
-		partitions {
-			compatible = "fixed-partitions";
-			#address-cells = <1>;
-			#size-cells = <1>;
-
-			partition@0 {
-				label = "u-boot";
-				reg = <0x0 0x30000>;
-				read-only;
-			};
-
-			partition@30000 {
-				label = "u-boot-env";
-				reg = <0x30000 0x10000>;
-				read-only;
-			};
-
-			factory: partition@40000 {
-				label = "factory";
-				reg = <0x40000 0x10000>;
-				read-only;
-			};
-
-			partition@50000 {
-				compatible = "denx,uimage";
-				label = "firmware";
-				reg = <0x50000 0x7b0000>;
-			};
-		};
-	};
-
-	spidev@1 {
-		compatible = "rohm,dh2228fv";
-		reg = <1>;
-		spi-max-frequency = <40000000>;
-	};
-};
-
-&i2c {
-	status = "okay";
-};
-
-&gdma {
-	status = "okay";
-};
-
-&i2s {
-	status = "okay";
-
-	pinctrl-names = "default";
-	pinctrl-0 = <&i2s_pins>;
-};
-
-&uart1 {
-	status = "okay";
-};
-
-&ethernet {
-	nvmem-cells = <&macaddr_factory_28>;
-	nvmem-cell-names = "mac-address";
-};
-
-&sdhci {
-	status = "okay";
-};
-
-&wmac {
-	status = "okay";
-
-	mediatek,mtd-eeprom = <&factory 0x0>;
-};
-
-&factory {
-	compatible = "nvmem-cells";
-	#address-cells = <1>;
-	#size-cells = <1>;
-
-	macaddr_factory_28: macaddr@28 {
-		reg = <0x28 0x6>;
-	};
 };

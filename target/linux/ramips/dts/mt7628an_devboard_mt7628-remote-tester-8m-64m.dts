@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "mt7628an_devboard_mt7628-8m-64m.dtsi"
+
+/ {
+	compatible = "devboard,mt7628-remote-tester-8m-64m", "mediatek,mt7628an-soc";
+	model = "DevBoard MT7628 Remote Tester (8M Flash / 64M RAM)";
+};
+
+&gpio {
+	gpio-line-names =
+		"HAT_I2S_SDI",
+		"HAT_I2S_SDO",
+		"HAT_I2S_WS",
+		"HAT_I2S_BCLK",
+		"HAT_I2C_SCL",
+		"HAT_I2C_SDA",
+		"LORA_CS_N",
+		"HAT_SPI_CE0_N",
+		"SPI_CLK_SOC",
+		"SPI_MOSI_SOC",
+		"SPI_MISO_SOC",
+		"HAT_GPIO4",
+		"UART0_TX_CH340",
+		"UART0_RX_CH340",
+		"LORA_RESET_N",
+		"LORA_BUSY",
+		"LORA_DIO1",
+		"LORA_TXEN",
+		"LORA_RXEN",
+		"",
+		"",
+		"",
+		"SD_WP",
+		"SD_CD",
+		"SD_D1",
+		"SD_D0",
+		"SD_CLK",
+		"SD_D2",
+		"SD_CMD",
+		"SD_D3",
+		"HAT_GPIO17",
+		"HAT_GPIO27",
+		"HAT_GPIO22",
+		"HAT_GPIO23",
+		"",
+		"HAT_GPIO25",
+		"",
+		"",
+		"WIFI_RESET_N",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"HAT_UART_TX",
+		"HAT_UART_RX";
+};
+
+&spi0 {
+	spidev@1 {
+		spi-max-frequency = <16000000>;
+	};
+};
