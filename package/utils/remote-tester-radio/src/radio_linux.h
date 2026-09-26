@@ -4,10 +4,12 @@
 
 #include "radio_core.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct gpiod_chip;
 struct gpiod_line;
+struct radiolib_backend;
 
 struct radio_lines {
 	const char *reset;
@@ -26,6 +28,7 @@ struct radio_linux {
 	struct gpiod_line *dio1;
 	struct gpiod_line *txen;
 	struct gpiod_line *rxen;
+	struct radiolib_backend *backend;
 	uint8_t last_rx[240];
 	uint8_t last_rx_len;
 	int8_t last_rssi_dbm;
@@ -36,6 +39,9 @@ struct radio_linux {
 	uint8_t last_command_status;
 	bool faulted;
 	bool configured;
+	bool network_tx_allowed;
+	bool cad_result_valid;
+	bool last_cad_busy;
 };
 
 int radio_linux_open(struct radio_linux *radio, const char *spidev, const char *gpiochip,
@@ -46,7 +52,15 @@ int radio_linux_probe(struct radio_linux *radio, const struct radio_config *conf
 int radio_linux_set_frequency(struct radio_linux *radio, uint32_t frequency_mhz);
 int radio_linux_start_receive(struct radio_linux *radio, uint8_t payload_len, bool continuous);
 int radio_linux_start_tx_test(struct radio_linux *radio);
+/* Network TX is fail-closed until explicitly enabled by the daemon. */
+int radio_linux_set_network_tx_allowed(struct radio_linux *radio, bool allowed);
+/* Payloads are limited to the public 240-byte receive buffer. */
+int radio_linux_start_transmit(struct radio_linux *radio, const uint8_t *data, size_t len);
+int radio_linux_start_cad(struct radio_linux *radio);
+/* Returns -EAGAIN until a CAD_DONE IRQ has been handled. */
+int radio_linux_cad_result(struct radio_linux *radio, bool *busy);
 int radio_linux_sample_rssi(struct radio_linux *radio, int16_t *rssi_dbm);
+/* irq contains the raw SX126x IRQ bit mask; RX_DONE also updates last_rx/metrics. */
 int radio_linux_handle_irq(struct radio_linux *radio, uint16_t *irq);
 int radio_linux_cleanup(struct radio_linux *radio);
 

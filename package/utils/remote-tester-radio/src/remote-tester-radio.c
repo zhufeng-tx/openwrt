@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "radio_linux.h"
+#include "rt_network_runtime.h"
+#include "network/network.h"
 #include "vendor/sx126x/sx126x.h"
 #include <errno.h>
 #include <gpiod.h>
@@ -17,6 +19,12 @@
 enum { SCAN_START, SCAN_END, SCAN_DWELL, __SCAN_MAX };
 enum { RECEIVE_TIMEOUT, __RECEIVE_MAX };
 enum { TX_ANTENNA_CONFIRMED, __TX_MAX };
+
+enum network_role {
+	NETWORK_ROLE_DIAGNOSTIC,
+	NETWORK_ROLE_CONTROLLER,
+	NETWORK_ROLE_NODE,
+};
 
 static const struct blobmsg_policy scan_policy[__SCAN_MAX] = {
 	[SCAN_START] = { .name = "start_mhz", .type = BLOBMSG_TYPE_INT32 },
@@ -40,6 +48,23 @@ struct settings {
 	char dio1[64];
 	char txen[64];
 	char rxen[64];
+	char serial_device[64];
+	char host_uart[64];
+	char host_psk_file[128];
+	char beacon_key_file[128];
+	char node_psk_file[128];
+	char node_registry_file[128];
+	char advertise_ipv4[64];
+	char controller_ipv4[64];
+	char node_eui[17];
+	enum network_role role;
+	uint32_t network_id;
+	uint32_t host_port;
+	uint32_t node_port;
+	uint32_t queue_bytes;
+	bool network_tx_enabled;
+	bool antenna_confirmed;
+	bool lab_mode;
 	bool enabled;
 };
 
@@ -47,6 +72,7 @@ struct daemon {
 	struct ubus_context *ubus;
 	struct ubus_object object;
 	struct radio_linux radio;
+	struct rt_network_runtime *network;
 	struct settings settings;
 	struct uloop_timeout operation_timer;
 	struct uloop_fd dio_fd;
@@ -84,6 +110,24 @@ static int copy_option(char *target, size_t target_size, const char *value)
 	return 0;
 }
 
+static const char *network_role_name(enum network_role role)
+{
+	switch (role) {
+	case NETWORK_ROLE_CONTROLLER: return "controller";
+	case NETWORK_ROLE_NODE: return "node";
+	default: return "diagnostic";
+	}
+}
+
+static int parse_network_role(const char *value, enum network_role *role)
+{
+	if (!strcmp(value, "diagnostic")) *role = NETWORK_ROLE_DIAGNOSTIC;
+	else if (!strcmp(value, "controller")) *role = NETWORK_ROLE_CONTROLLER;
+	else if (!strcmp(value, "node")) *role = NETWORK_ROLE_NODE;
+	else return -EINVAL;
+	return 0;
+}
+
 static int load_settings(struct settings *settings)
 {
 	struct uci_context *uci;
@@ -116,6 +160,7 @@ static int load_settings(struct settings *settings)
 	if (!settings->enabled) { err = -ECANCELED; goto out; }
 	#define LOAD_STRING(member, option, fallback) do { value = option_string(uci, section, option, fallback); if (!err) err = copy_option(settings->member, sizeof(settings->member), value); } while (0)
 	#define LOAD_U32(member, option, fallback) do { value = option_string(uci, section, option, fallback); if (!err) err = parse_u32(value, &settings->profile.member); } while (0)
+	#define LOAD_SETTING_U32(member, option, fallback) do { value = option_string(uci, section, option, fallback); if (!err) err = parse_u32(value, &settings->member); } while (0)
 	LOAD_STRING(spidev, "spidev", "/dev/spidev0.1");
 	LOAD_STRING(gpiochip, "gpiochip", "/dev/gpiochip0");
 	LOAD_STRING(reset, "reset_line", "LORA_RESET_N");
@@ -130,14 +175,41 @@ static int load_settings(struct settings *settings)
 	LOAD_U32(sync_word, "sync_word", "0x1424");
 	LOAD_U32(spi_hz, "spi_hz", "2000000");
 	value = option_string(uci, section, "allow_tx_test", "0"); settings->profile.allow_tx_test = !strcmp(value, "1");
+	value = option_string(uci, section, "role", "diagnostic");
+	if (!err) err = parse_network_role(value, &settings->role);
+	LOAD_STRING(serial_device, "serial_device", "/dev/ttyS1");
+	LOAD_STRING(host_uart, "host_uart", "/dev/ttyS1");
+	LOAD_STRING(host_psk_file, "host_psk_file", "/etc/remote-tester-radio/host.psk");
+	LOAD_STRING(beacon_key_file, "beacon_key_file", "/etc/remote-tester-radio/beacon.key");
+	LOAD_STRING(node_psk_file, "node_psk_file", "/etc/remote-tester-radio/node.psk");
+	LOAD_STRING(node_registry_file, "node_registry_file", "/etc/remote-tester-radio/nodes.keys");
+	LOAD_STRING(advertise_ipv4, "advertise_ipv4", "");
+	LOAD_STRING(controller_ipv4, "controller_ipv4", "");
+	LOAD_STRING(node_eui, "node_eui", "");
+	LOAD_SETTING_U32(network_id, "network_id", "1");
+	LOAD_SETTING_U32(host_port, "host_port", "45671");
+	LOAD_SETTING_U32(node_port, "node_port", "45670");
+	LOAD_SETTING_U32(queue_bytes, "queue_bytes", "2097152");
+	value = option_string(uci, section, "network_tx_enabled", "0");
+	settings->network_tx_enabled = !strcmp(value, "1");
+	value = option_string(uci, section, "antenna_confirmed", "0");
+	settings->antenna_confirmed = !strcmp(value, "1");
+	value = option_string(uci, section, "lab_mode", "0");
+	settings->lab_mode = !strcmp(value, "1");
 	#undef LOAD_STRING
 	#undef LOAD_U32
+	#undef LOAD_SETTING_U32
 	settings->lines.reset = settings->reset;
 	settings->lines.busy = settings->busy;
 	settings->lines.dio1 = settings->dio1;
 	settings->lines.txen = settings->txen;
 	settings->lines.rxen = settings->rxen;
 	if (!err) err = radio_config_validate(&settings->profile);
+	if (!err && (settings->network_id == 0 || settings->network_id > UINT16_MAX ||
+	    settings->host_port == 0 || settings->host_port > UINT16_MAX ||
+	    settings->node_port == 0 || settings->node_port > UINT16_MAX ||
+	    settings->queue_bytes < 65536 || settings->queue_bytes > 4U * 1024U * 1024U))
+		err = -EINVAL;
 out:
 	if (package) uci_unload(uci, package);
 	uci_free_context(uci);
@@ -146,7 +218,8 @@ out:
 
 static bool operation_busy(const struct daemon *daemon)
 {
-	return !radio_op_can_start(daemon->operation);
+	return daemon->settings.role != NETWORK_ROLE_DIAGNOSTIC ||
+		!radio_op_can_start(daemon->operation);
 }
 
 static uint64_t monotonic_ms(void)
@@ -198,6 +271,12 @@ static void add_status(struct daemon *daemon, struct blob_buf *buffer, int resul
 	blobmsg_add_u32(buffer, "sync_word", daemon->settings.profile.sync_word);
 	blobmsg_add_u32(buffer, "spi_hz", daemon->settings.profile.spi_hz);
 	blobmsg_add_u8(buffer, "tx_test_enabled", daemon->settings.profile.allow_tx_test);
+	blobmsg_add_string(buffer, "role", network_role_name(daemon->settings.role));
+	blobmsg_add_u8(buffer, "network_tx_enabled", daemon->settings.network_tx_enabled &&
+		daemon->settings.antenna_confirmed && daemon->settings.lab_mode);
+	blobmsg_add_u32(buffer, "network_id", daemon->settings.network_id);
+	if (daemon->network)
+		rt_network_runtime_add_status(daemon->network, buffer);
 	blobmsg_add_u32(buffer, "last_irq", daemon->radio.last_irq);
 	blobmsg_add_u32(buffer, "result", result ? (uint32_t)-result : 0);
 }
@@ -350,8 +429,17 @@ static void dio_cb(struct uloop_fd *fd, unsigned int events)
 	if (gpiod_line_event_read(daemon->radio.dio1, &event)) return;
 	err = radio_linux_handle_irq(&daemon->radio, &irq);
 	if (err) {
+		if (daemon->network && err == -EOVERFLOW) return;
+		if (daemon->network) { uloop_end(); return; }
 		if (daemon->operation == RADIO_OP_RECEIVE) finish_receive(daemon, false, err);
 		else if (daemon->operation == RADIO_OP_TX) finish_tx(daemon, false, err);
+		return;
+	}
+	if (daemon->network) {
+		if (irq & (SX126X_IRQ_CRC_ERROR | SX126X_IRQ_HEADER_ERROR)) return;
+		uint64_t irq_us = (uint64_t)event.ts.tv_sec * 1000000U +
+			(uint64_t)event.ts.tv_nsec / 1000U;
+		if (rt_network_runtime_on_irq(daemon->network, irq, irq_us)) uloop_end();
 		return;
 	}
 	if (daemon->operation == RADIO_OP_RECEIVE &&
@@ -490,6 +578,7 @@ static void terminate_cb(int signo)
 int main(void)
 {
 	struct daemon daemon = {};
+	struct rt_network_config network_config = {};
 	int result;
 
 	result = load_settings(&daemon.settings);
@@ -497,8 +586,14 @@ int main(void)
 	result = radio_linux_open(&daemon.radio, daemon.settings.spidev, daemon.settings.gpiochip,
 		&daemon.settings.lines, &daemon.settings.profile);
 	if (result) { fprintf(stderr, "radio resources: %s\n", strerror(-result)); return 1; }
-	/* A chip/configuration failure remains observable through ubus and is recoverable only by probe. */
-	(void)radio_linux_configure(&daemon.radio, &daemon.settings.profile, 240);
+	/* Diagnostic mode exposes a failed probe through ubus; network mode needs a ready PHY. */
+	result = radio_linux_configure(&daemon.radio, &daemon.settings.profile, 240);
+	if (result && daemon.settings.role != NETWORK_ROLE_DIAGNOSTIC) {
+		fprintf(stderr, "network radio configure: %s\n", strerror(-result));
+		(void)radio_linux_cleanup(&daemon.radio);
+		radio_linux_close(&daemon.radio);
+		return 1;
+	}
 	uloop_init();
 	daemon.ubus = ubus_connect(NULL);
 	if (!daemon.ubus) { (void)radio_linux_cleanup(&daemon.radio); radio_linux_close(&daemon.radio); return 1; }
@@ -519,8 +614,45 @@ int main(void)
 		radio_linux_close(&daemon.radio);
 		return 1;
 	}
+	if (daemon.settings.role != NETWORK_ROLE_DIAGNOSTIC) {
+		network_config.role = daemon.settings.role == NETWORK_ROLE_CONTROLLER ?
+			RT_NETWORK_CONTROLLER : RT_NETWORK_NODE;
+		network_config.network_id = daemon.settings.network_id;
+		network_config.node_eui = daemon.settings.node_eui;
+		network_config.beacon_key_path = daemon.settings.beacon_key_file;
+		network_config.node_psk_path = daemon.settings.node_psk_file;
+		network_config.node_registry_path = daemon.settings.node_registry_file;
+		network_config.controller_ipv4 = daemon.settings.controller_ipv4;
+		network_config.host_port = (uint16_t)daemon.settings.host_port;
+		network_config.node_port = (uint16_t)daemon.settings.node_port;
+		if (network_config.role == RT_NETWORK_CONTROLLER) {
+			network_config.host_psk_path = daemon.settings.host_psk_file;
+			network_config.host_uart_path = daemon.settings.host_uart;
+		} else {
+			network_config.serial_path = daemon.settings.serial_device;
+		}
+		network_config.queue_bytes = daemon.settings.queue_bytes;
+		network_config.airtime_budget_us =
+			(NETWORK_FRAME_MS - NETWORK_CONTENTION_MS - 200U) * 1000U;
+		network_config.radio = &daemon.radio;
+		network_config.radio_profile = daemon.settings.profile;
+		network_config.transmit_enabled = daemon.settings.network_tx_enabled &&
+			daemon.settings.antenna_confirmed && daemon.settings.lab_mode;
+		result = radio_linux_set_network_tx_allowed(&daemon.radio,
+			network_config.transmit_enabled);
+		if (!result) result = rt_network_runtime_start(&daemon.network, &network_config);
+		if (result) {
+			fprintf(stderr, "network startup: %s\n", strerror(-result));
+			ubus_free(daemon.ubus);
+			(void)radio_linux_cleanup(&daemon.radio);
+			uloop_done();
+			radio_linux_close(&daemon.radio);
+			return 1;
+		}
+	}
 	uloop_run();
-	if (stop_requested && operation_busy(&daemon)) finish_operation(&daemon, -ECANCELED);
+	rt_network_runtime_stop(daemon.network);
+	if (stop_requested && daemon.operation != RADIO_OP_IDLE) finish_operation(&daemon, -ECANCELED);
 	(void)radio_linux_cleanup(&daemon.radio);
 	ubus_free(daemon.ubus);
 	uloop_done();

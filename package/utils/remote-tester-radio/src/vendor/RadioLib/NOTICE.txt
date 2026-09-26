@@ -1,0 +1,10 @@
+RadioLib source in this directory is a minimal source subset from the
+RadioLib 7.7.1 release, tag commit 034126ef3b5305394d1e4e14a5049482ec10c1c4.
+Upstream: https://github.com/jgromes/RadioLib/tree/7.7.1
+RadioLib source is MIT licensed; see LICENSE. The upstream binary patch data in
+src/modules/SX126x/patches/SX126x_patch_scan.h carries a separate BSD-3-Clause
+notice, reproduced in that header and included in package license metadata.
+
+This subset contains the generic HAL, Module, PhysicalLayer and utility code
+needed by the SX1262 driver. RadioLib's other radio modules and protocol
+implementations are not included.

@@ -2,22 +2,25 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=remote-tester-radio
-PKG_RELEASE:=1
-PKG_LICENSE:=GPL-2.0-only AND BSD-3-Clause-Clear
-PKG_LICENSE_FILES:=vendor/sx126x/LICENSE.txt
+PKG_RELEASE:=2
+PKG_LICENSE:=GPL-2.0-only AND BSD-3-Clause-Clear AND BSD-3-Clause AND MIT
+PKG_LICENSE_FILES:=vendor/sx126x/LICENSE.txt vendor/RadioLib/LICENSE \
+	vendor/RadioLib/src/modules/SX126x/patches/SX126x_patch_scan.h
 
 include $(INCLUDE_DIR)/package.mk
 
 define Package/remote-tester-radio
   SECTION:=utils
   CATEGORY:=Utilities
-  TITLE:=SX1262 radio HAL and diagnostic daemon
-  DEPENDS:=+libubus +libubox +libuci +libgpiod +kmod-spi-dev
+  TITLE:=SX1262 RadioLib PHY, diagnostics, and star-network daemon
+  DEPENDS:=+libubus +libubox +libblobmsg-json +libuci +libgpiod +kmod-spi-dev +libstdcpp +libmbedtls +zlib +iperf3
 endef
 
 define Package/remote-tester-radio/description
-Local-only SX1262 HAL and diagnostics daemon. TX is disabled by default and is
-limited to the fixed diagnostic frame after an explicit antenna confirmation.
+SX1262 RadioLib PHY with local diagnostics, configured direct star-network
+service, and authenticated iPerf control. Network TX is disabled by default and
+requires explicit configuration plus antenna confirmation; diagnostic TX
+remains separately gated.
 endef
 
 define Build/Prepare
@@ -27,7 +30,9 @@ endef
 define Build/Configure
 endef
 define Build/Compile
-	$(MAKE) -C $(PKG_BUILD_DIR) CC="$(TARGET_CC)" CFLAGS="$(TARGET_CFLAGS)" TARGET_LDFLAGS="$(TARGET_LDFLAGS)"
+	$(MAKE) -C $(PKG_BUILD_DIR) CC="$(TARGET_CC)" CXX="$(TARGET_CXX)" \
+		TARGET_CPPFLAGS="$(TARGET_CPPFLAGS)" TARGET_CFLAGS="$(TARGET_CFLAGS)" \
+		TARGET_CXXFLAGS="$(TARGET_CXXFLAGS)" TARGET_LDFLAGS="$(TARGET_LDFLAGS)"
 endef
 define Package/remote-tester-radio/conffiles
 /etc/config/remote-tester-radio
